@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_VERSION: "10.0.x"
+  PROJECT_PATH: GitRekt/GitRekt.csproj
+
+jobs:
+  publish:
+    name: Publish ${{ matrix.rid }}
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            os: windows-latest
+            archive: zip
+          - rid: linux-x64
+            os: ubuntu-latest
+            archive: tar.gz
+          - rid: osx-x64
+            os: macos-13
+            archive: tar.gz
+          - rid: osx-arm64
+            os: macos-14
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install Linux NativeAOT prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Publish NativeAOT executable
+        shell: pwsh
+        run: |
+          $rid = '${{ matrix.rid }}'
+          $publishDir = Join-Path $PWD "publish/$rid"
+          $isWindowsRid = $rid -like 'win-*'
+
+          dotnet publish $env:PROJECT_PATH `
+            --configuration Release `
+            --runtime $rid `
+            --self-contained true `
+            -p:PublishAot=true `
+            -p:PublishSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            --output $publishDir
+
+          $exeName = if ($isWindowsRid) { 'GitRekt.exe' } else { 'GitRekt' }
+          $exePath = Join-Path $publishDir $exeName
+
+          if (!(Test-Path -LiteralPath $exePath)) {
+            throw "Expected NativeAOT executable was not produced: $exePath"
+          }
+
+          if (!$isWindowsRid) {
+            chmod +x $exePath
+          }
+
+      - name: Package executable
+        shell: pwsh
+        run: |
+          $rid = '${{ matrix.rid }}'
+          $archiveType = '${{ matrix.archive }}'
+          $publishDir = Join-Path $PWD "publish/$rid"
+          $distDir = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+
+          if ($archiveType -eq 'zip') {
+            Compress-Archive `
+              -Path (Join-Path $publishDir 'GitRekt.exe') `
+              -DestinationPath (Join-Path $distDir "gitrekt-$rid.zip") `
+              -Force
+          } else {
+            tar -czf (Join-Path $distDir "gitrekt-$rid.tar.gz") -C $publishDir GitRekt
+          }
+
+      - name: Upload packaged executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitrekt-${{ matrix.rid }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    if: github.ref_name == github.event.repository.default_branch
+    needs: publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download packaged executables
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: gitrekt-${{ github.run_number }}.${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG_NAME" dist/* \
+            --title "GitRekt $TAG_NAME" \
+            --notes "Automated NativeAOT release for commit $GITHUB_SHA." \
+            --target "$GITHUB_SHA" \
+            --latest

@@ -2,7 +2,7 @@
   "profiles": {
     "GitRekt": {
       "commandName": "Project",
-      "commandLineArgs": "--ai --ai-agent --ai-model \"gemma4:31b-cloud\" --ai-verdict yellow --github-app-id 3562299 --github-app-installation-id Iv23lig3Il4PCJyYQrrn -q \"@example.com\" "
+      "commandLineArgs": "--ai --ai-agent --ai-model \"gemma4:31b-cloud\" --ai-verdict yellow --github-app-id 3562299 --github-app-installation-id 128570455 -q \"@example.com\""
     }
   }
 }

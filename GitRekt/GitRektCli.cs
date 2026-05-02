@@ -42,9 +42,13 @@ internal static class GitRektCli
 
         var aiAgentOption = new Option<bool>("--ai-agent", "Use Microsoft Agent Framework to gather same-repository evidence before AI validation.");
 
-        var aiProviderOption = new Option<string?>("--ai-provider", "AI provider for validation. Defaults to ollama.");
+        var aiProviderOption = new Option<string?>("--ai-provider", "AI provider for validation. Defaults to ollama. Supported: ollama, gemini, openai.");
 
         var aiModelOption = new Option<string?>("--ai-model", "Model name used for AI validation.");
+
+        var aiApiKeyOption = new Option<string?>("--ai-api-key", "AI provider API key. For Gemini, defaults to GEMINI_API_KEY or GOOGLE_API_KEY. For OpenAI, defaults to OPENAI_API_KEY.");
+        aiApiKeyOption.AddAlias("--gemini-api-key");
+        aiApiKeyOption.AddAlias("--openai-api-key");
 
         var aiVerdictOption = new Option<string?>("--ai-verdict", "Only show AI validation verdicts at or above this category. Values: likely/red, possible/yellow, none/green.")
         {
@@ -65,6 +69,8 @@ Examples:
   GitRekt --query "Password1" --ai --ai-model llama3.2
   GitRekt --query "Password1" --ai --ai-model llama3.2 --ai-verdict yellow
   GitRekt --query "Password1" --ai --ai-agent --ai-model llama3.2 --ai-verdict yellow
+  GitRekt --query "Password1" --ai-provider gemini --ai-model gemini-2.5-flash
+  GitRekt --query "Password1" --ai-provider openai --ai-model gpt-5-mini
   GitRekt --github-app-id 12345 --github-app-private-key-path app.pem --query "Password1"
   GitRekt --github-app-id 12345 --github-app-installation-id 67890 --github-app-private-key-path app.pem --query "Password1"
 """);
@@ -80,6 +86,7 @@ Examples:
         rootCommand.AddOption(aiAgentOption);
         rootCommand.AddOption(aiProviderOption);
         rootCommand.AddOption(aiModelOption);
+        rootCommand.AddOption(aiApiKeyOption);
         rootCommand.AddOption(aiVerdictOption);
         rootCommand.AddValidator(parseResult =>
         {
@@ -100,9 +107,10 @@ Examples:
             var hasAiAgentFlag = parseResult.FindResultFor(aiAgentOption) is not null;
             var hasAiProvider = parseResult.FindResultFor(aiProviderOption) is not null;
             var hasAiModel = parseResult.FindResultFor(aiModelOption) is not null;
+            var hasAiApiKey = parseResult.FindResultFor(aiApiKeyOption) is not null;
             var hasAiVerdictFilter = !string.IsNullOrWhiteSpace(parseResult.GetValueForOption(aiVerdictOption));
 
-            if (!hasAiFlag && !hasAiAgentFlag && !hasAiProvider && !hasAiModel && !hasAiVerdictFilter)
+            if (!hasAiFlag && !hasAiAgentFlag && !hasAiProvider && !hasAiModel && !hasAiApiKey && !hasAiVerdictFilter)
             {
                 return;
             }
@@ -117,11 +125,43 @@ Examples:
 
             var aiProvider = parseResult.GetValueForOption(aiProviderOption);
 
-            if (!string.IsNullOrWhiteSpace(aiProvider)
+            if (!IsSupportedAiProvider(aiProvider))
+            {
+                parseResult.ErrorMessage = "Unsupported --ai-provider value. Supported: ollama, gemini, openai.";
+                return;
+            }
+
+            if (parseResult.GetValueForOption(aiAgentOption)
+                && !string.IsNullOrWhiteSpace(aiProvider)
                 && !string.Equals(aiProvider, "ollama", StringComparison.OrdinalIgnoreCase))
             {
-                parseResult.ErrorMessage = "Unsupported --ai-provider value. Currently supported: ollama.";
+                parseResult.ErrorMessage = "--ai-agent is currently only supported with --ai-provider ollama.";
                 return;
+            }
+
+            if (string.Equals(aiProvider, "gemini", StringComparison.OrdinalIgnoreCase))
+            {
+                var aiApiKey = parseResult.GetValueForOption(aiApiKeyOption)
+                    ?? Environment.GetEnvironmentVariable("GEMINI_API_KEY")
+                    ?? Environment.GetEnvironmentVariable("GOOGLE_API_KEY");
+
+                if (string.IsNullOrWhiteSpace(aiApiKey))
+                {
+                    parseResult.ErrorMessage = "Gemini AI validation requires --ai-api-key, --gemini-api-key, GEMINI_API_KEY, or GOOGLE_API_KEY.";
+                    return;
+                }
+            }
+
+            if (string.Equals(aiProvider, "openai", StringComparison.OrdinalIgnoreCase))
+            {
+                var aiApiKey = parseResult.GetValueForOption(aiApiKeyOption)
+                    ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+
+                if (string.IsNullOrWhiteSpace(aiApiKey))
+                {
+                    parseResult.ErrorMessage = "OpenAI validation requires --ai-api-key, --openai-api-key, or OPENAI_API_KEY.";
+                    return;
+                }
             }
 
             var aiVerdict = parseResult.GetValueForOption(aiVerdictOption);
@@ -149,12 +189,14 @@ Examples:
             var useAiAgent = parseResult.GetValueForOption(aiAgentOption);
             var aiProvider = parseResult.GetValueForOption(aiProviderOption);
             var aiModel = parseResult.GetValueForOption(aiModelOption);
+            var aiApiKey = parseResult.GetValueForOption(aiApiKeyOption);
             var aiVerdicts = parseResult.GetValueForOption(aiVerdictOption);
             var aiVerdictFilter = ParseAiValidationVerdict(aiVerdicts);
             var shouldValidateAi = validateAi
                 || useAiAgent
                 || !string.IsNullOrWhiteSpace(aiProvider)
                 || !string.IsNullOrWhiteSpace(aiModel)
+                || !string.IsNullOrWhiteSpace(aiApiKey)
                 || aiVerdictFilter is not null;
 
             if (queries.Length == 0)
@@ -167,10 +209,34 @@ Examples:
                 throw new InvalidOperationException("--ai-model is required when AI validation is enabled.");
             }
 
-            if (!string.IsNullOrWhiteSpace(aiProvider)
-                && !string.Equals(aiProvider, "ollama", StringComparison.OrdinalIgnoreCase))
+            if (!IsSupportedAiProvider(aiProvider))
             {
-                throw new InvalidOperationException("Unsupported --ai-provider value. Currently supported: ollama.");
+                throw new InvalidOperationException("Unsupported --ai-provider value. Supported: ollama, gemini, openai.");
+            }
+
+            aiProvider = string.IsNullOrWhiteSpace(aiProvider) ? "ollama" : aiProvider;
+
+            if (useAiAgent && !string.Equals(aiProvider, "ollama", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("--ai-agent is currently only supported with --ai-provider ollama.");
+            }
+
+            aiApiKey ??= string.Equals(aiProvider, "gemini", StringComparison.OrdinalIgnoreCase)
+                ? Environment.GetEnvironmentVariable("GEMINI_API_KEY") ?? Environment.GetEnvironmentVariable("GOOGLE_API_KEY")
+                : string.Equals(aiProvider, "openai", StringComparison.OrdinalIgnoreCase)
+                    ? Environment.GetEnvironmentVariable("OPENAI_API_KEY")
+                    : null;
+
+            if (string.Equals(aiProvider, "gemini", StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(aiApiKey))
+            {
+                throw new InvalidOperationException("Gemini AI validation requires --ai-api-key, --gemini-api-key, GEMINI_API_KEY, or GOOGLE_API_KEY.");
+            }
+
+            if (string.Equals(aiProvider, "openai", StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(aiApiKey))
+            {
+                throw new InvalidOperationException("OpenAI validation requires --ai-api-key, --openai-api-key, or OPENAI_API_KEY.");
             }
 
             var accessToken = token ?? Environment.GetEnvironmentVariable("GITHUB_ACCESS_TOKEN");
@@ -200,9 +266,10 @@ Examples:
                 useAdvancedQuery,
                 shouldValidateAi
                     ? new AiValidationConfiguration(
-                        string.IsNullOrWhiteSpace(aiProvider) ? "ollama" : aiProvider,
+                        aiProvider,
                         aiModel!,
-                        useAiAgent)
+                        useAiAgent,
+                        aiApiKey)
                     : null,
                 aiVerdictFilter);
         });
@@ -277,6 +344,14 @@ Examples:
                 verdict = default;
                 return false;
         }
+    }
+
+    private static bool IsSupportedAiProvider(string? provider)
+    {
+        return string.IsNullOrWhiteSpace(provider)
+            || string.Equals(provider, "ollama", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(provider, "gemini", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(provider, "openai", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsHelpRequested(IEnumerable<string> args)
@@ -375,13 +450,17 @@ Options:
   --advanced, --raw-query                     Pass each query to GitHub code search unchanged.
   --ai                                        Validate each displayed result with AI.
   --ai-agent                                  Use Microsoft Agent Framework to gather same-repository evidence before AI validation.
-  --ai-provider <provider>                    AI provider for validation. Currently supported: ollama.
+  --ai-provider <provider>                    AI provider for validation. Supported: ollama, gemini, openai.
   --ai-model <model>                          Model name used for AI validation.
+  --ai-api-key, --gemini-api-key, --openai-api-key <key>
+                                               AI provider API key. For Gemini, defaults to GEMINI_API_KEY or GOOGLE_API_KEY. For OpenAI, defaults to OPENAI_API_KEY.
   --ai-verdict <verdict>                      Only show AI verdicts at or above likely/red, possible/yellow, or none/green.
   -h, --help                                  Show help.
 
 Examples:
   GitRekt --query "Password1"
+  GitRekt --query "Password1" --ai-provider gemini --ai-model gemini-2.5-flash
+  GitRekt --query "Password1" --ai-provider openai --ai-model gpt-5-mini
   GitRekt --github-app-id 12345 --query "Password1"
   GitRekt --github-app-id 12345 --github-app-installation-id 67890 --github-app-private-key-path app.private-key.pem --query "Password1"
 """);

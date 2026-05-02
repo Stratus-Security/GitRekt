@@ -19,17 +19,26 @@ internal sealed class GithubClient : IDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _disposeHttpClient;
     private readonly bool _hasAuthentication;
+    private readonly IGithubAccessTokenProvider? _accessTokenProvider;
     private readonly Action<string>? _showStatusMessage;
     private readonly Action? _clearStatusMessage;
     private readonly Dictionary<string, GithubRateLimitState> _rateLimitStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _fileContentCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, GithubRepositoryTreeResponse> _repositoryTreeCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _rateLimitLock = new();
     private readonly object _fileContentCacheLock = new();
+    private readonly object _repositoryTreeCacheLock = new();
 
-    public GithubClient(string? accessToken = null, HttpClient? httpClient = null, Action<string>? showStatusMessage = null, Action? clearStatusMessage = null)
+    public GithubClient(
+        string? accessToken = null,
+        HttpClient? httpClient = null,
+        Action<string>? showStatusMessage = null,
+        Action? clearStatusMessage = null,
+        IGithubAccessTokenProvider? accessTokenProvider = null)
     {
         _httpClient = httpClient ?? new HttpClient();
         _disposeHttpClient = httpClient is null;
+        _accessTokenProvider = accessTokenProvider;
         _showStatusMessage = showStatusMessage;
         _clearStatusMessage = clearStatusMessage;
 
@@ -54,7 +63,7 @@ internal sealed class GithubClient : IDisposable
             _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
         }
 
-        _hasAuthentication = !string.IsNullOrWhiteSpace(accessToken);
+        _hasAuthentication = !string.IsNullOrWhiteSpace(accessToken) || accessTokenProvider is not null;
     }
 
     public async Task<GithubCodeSearchResults> SearchCodeAsync(string query, bool useAdvancedQuery = false, CancellationToken cancellationToken = default)
@@ -135,6 +144,39 @@ internal sealed class GithubClient : IDisposable
         var perPage = Math.Clamp(limit, 1, MaxPageSize);
         var searchResponse = await SearchCodePageAsync(searchQuery, perPage, 1, cancellationToken);
         return searchResponse.Items.Take(limit).ToList();
+    }
+
+    public async Task<GithubRepositoryTreeResponse> GetRepositoryTreeAsync(string repositoryFullName, string reference = "HEAD", CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(repositoryFullName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(reference);
+
+        var cacheKey = $"{repositoryFullName}\n{reference}";
+
+        lock (_repositoryTreeCacheLock)
+        {
+            if (_repositoryTreeCache.TryGetValue(cacheKey, out var cachedTree))
+            {
+                return cachedTree;
+            }
+        }
+
+        var encodedRepository = Uri.EscapeDataString(repositoryFullName).Replace("%2F", "/", StringComparison.Ordinal);
+        var encodedReference = Uri.EscapeDataString(reference).Replace("%2F", "/", StringComparison.Ordinal);
+        var requestUri = $"repos/{encodedRepository}/git/trees/{encodedReference}?recursive=1";
+        var tree = await GetJsonAsync(
+            requestUri,
+            "core",
+            "GitHub repository tree fetch failed",
+            GithubJsonSerializerContext.Default.GithubRepositoryTreeResponse,
+            cancellationToken);
+
+        lock (_repositoryTreeCacheLock)
+        {
+            _repositoryTreeCache.TryAdd(cacheKey, tree);
+        }
+
+        return tree;
     }
 
     public async Task<string> GetRepositoryFileContentAsync(string repositoryFullName, string path, CancellationToken cancellationToken = default)
@@ -275,9 +317,12 @@ internal sealed class GithubClient : IDisposable
         JsonTypeInfo<T> jsonTypeInfo,
         CancellationToken cancellationToken)
     {
+        var refreshedAfterBadCredentials = false;
+
         for (var attempt = 0; ; attempt++)
         {
             await WaitForKnownRateLimitAsync(rateLimitResource, cancellationToken);
+            await EnsureFreshAccessTokenAsync(forceRefresh: false, cancellationToken);
 
             using var response = await _httpClient.GetAsync(requestUri, cancellationToken);
             UpdateRateLimitState(response, rateLimitResource);
@@ -291,23 +336,58 @@ internal sealed class GithubClient : IDisposable
 
             var errorResponse = await JsonSerializer.DeserializeAsync(contentStream, GithubJsonSerializerContext.Default.GithubErrorResponse, cancellationToken);
 
-            if (TryGetRateLimitDelay(response, errorResponse, out var retryDelay, out var rateLimitMessage))
+            if (!refreshedAfterBadCredentials
+                && IsBadCredentialsResponse(response, errorResponse)
+                && await TryRefreshAccessTokenAsync(cancellationToken))
+            {
+                refreshedAfterBadCredentials = true;
+                continue;
+            }
+
+            if (TryGetRateLimitDelay(response, errorResponse, rateLimitResource, out var retryDelay, out var rateLimitMessage, out var rateLimitDetails))
             {
                 if (attempt < MaxAutomaticRateLimitRetries && retryDelay <= MaxAutomaticRateLimitDelay)
                 {
-                    _showStatusMessage?.Invoke($"Waiting for GitHub API rate limit reset ({FormatDelay(retryDelay)})...");
+                    _showStatusMessage?.Invoke($"Waiting for GitHub {FormatRateLimitResource(rateLimitDetails.Resource)} rate limit reset ({FormatDelay(retryDelay)})...");
                     await Task.Delay(retryDelay + TimeSpan.FromMilliseconds(250), cancellationToken);
                     continue;
                 }
 
                 _clearStatusMessage?.Invoke();
-                throw CreateRateLimitException(response.StatusCode, retryDelay, rateLimitMessage);
+                throw CreateRateLimitException(response.StatusCode, retryDelay, rateLimitMessage, rateLimitDetails);
             }
 
             _clearStatusMessage?.Invoke();
             var errorMessage = errorResponse?.Message ?? response.ReasonPhrase;
             throw new HttpRequestException($"{failurePrefix}: {errorMessage}", null, response.StatusCode);
         }
+    }
+
+    private async Task EnsureFreshAccessTokenAsync(bool forceRefresh, CancellationToken cancellationToken)
+    {
+        if (_accessTokenProvider is null)
+        {
+            return;
+        }
+
+        var accessToken = await _accessTokenProvider.GetAccessTokenAsync(forceRefresh, cancellationToken);
+
+        if (!string.IsNullOrWhiteSpace(accessToken))
+        {
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        }
+    }
+
+    private async Task<bool> TryRefreshAccessTokenAsync(CancellationToken cancellationToken)
+    {
+        if (_accessTokenProvider is null)
+        {
+            return false;
+        }
+
+        _showStatusMessage?.Invoke("Refreshing GitHub credentials...");
+        await EnsureFreshAccessTokenAsync(forceRefresh: true, cancellationToken);
+        return _httpClient.DefaultRequestHeaders.Authorization is not null;
     }
 
     private async Task WaitForKnownRateLimitAsync(string rateLimitResource, CancellationToken cancellationToken)
@@ -317,10 +397,14 @@ internal sealed class GithubClient : IDisposable
             if (retryDelay > MaxAutomaticRateLimitDelay)
             {
                 _clearStatusMessage?.Invoke();
-                throw CreateRateLimitException(HttpStatusCode.Forbidden, retryDelay, $"Known GitHub {rateLimitResource} rate limit is exhausted.");
+                throw CreateRateLimitException(
+                    HttpStatusCode.Forbidden,
+                    retryDelay,
+                    $"Known GitHub {rateLimitResource} rate limit is exhausted.",
+                    new GithubRateLimitDetails(rateLimitResource, 0, null));
             }
 
-            _showStatusMessage?.Invoke($"Waiting for GitHub API rate limit reset ({FormatDelay(retryDelay)})...");
+            _showStatusMessage?.Invoke($"Waiting for GitHub {FormatRateLimitResource(rateLimitResource)} rate limit reset ({FormatDelay(retryDelay)})...");
             await Task.Delay(retryDelay + TimeSpan.FromMilliseconds(250), cancellationToken);
         }
     }
@@ -373,9 +457,16 @@ internal sealed class GithubClient : IDisposable
         }
     }
 
-    private bool TryGetRateLimitDelay(HttpResponseMessage response, GithubErrorResponse? errorResponse, out TimeSpan retryDelay, out string? rateLimitMessage)
+    private bool TryGetRateLimitDelay(
+        HttpResponseMessage response,
+        GithubErrorResponse? errorResponse,
+        string fallbackResource,
+        out TimeSpan retryDelay,
+        out string? rateLimitMessage,
+        out GithubRateLimitDetails rateLimitDetails)
     {
         rateLimitMessage = errorResponse?.Message;
+        rateLimitDetails = GetRateLimitDetails(response, fallbackResource);
 
         if (!IsRateLimitedResponse(response, rateLimitMessage))
         {
@@ -385,6 +476,23 @@ internal sealed class GithubClient : IDisposable
 
         retryDelay = GetRetryDelay(response, rateLimitMessage);
         return true;
+    }
+
+    private static GithubRateLimitDetails GetRateLimitDetails(HttpResponseMessage response, string fallbackResource)
+    {
+        var resource = TryGetHeaderValue(response.Headers, "X-RateLimit-Resource", out var resourceValue)
+            ? resourceValue!
+            : fallbackResource;
+        var remaining = TryGetHeaderValue(response.Headers, "X-RateLimit-Remaining", out var remainingValue)
+            && int.TryParse(remainingValue, out var parsedRemaining)
+                ? parsedRemaining
+                : (int?)null;
+        var limit = TryGetHeaderValue(response.Headers, "X-RateLimit-Limit", out var limitValue)
+            && int.TryParse(limitValue, out var parsedLimit)
+                ? parsedLimit
+                : (int?)null;
+
+        return new GithubRateLimitDetails(resource, remaining, limit);
     }
 
     private static bool IsRateLimitedResponse(HttpResponseMessage response, string? rateLimitMessage)
@@ -401,6 +509,12 @@ internal sealed class GithubClient : IDisposable
 
         return !string.IsNullOrWhiteSpace(rateLimitMessage)
             && rateLimitMessage.Contains("rate limit", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBadCredentialsResponse(HttpResponseMessage response, GithubErrorResponse? errorResponse)
+    {
+        return response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+            && string.Equals(errorResponse?.Message, "Bad credentials", StringComparison.OrdinalIgnoreCase);
     }
 
     private static TimeSpan GetRetryDelay(HttpResponseMessage response, string? rateLimitMessage)
@@ -442,9 +556,15 @@ internal sealed class GithubClient : IDisposable
         return DefaultRateLimitDelay;
     }
 
-    private HttpRequestException CreateRateLimitException(HttpStatusCode statusCode, TimeSpan retryDelay, string? rateLimitMessage)
+    private HttpRequestException CreateRateLimitException(HttpStatusCode statusCode, TimeSpan retryDelay, string? rateLimitMessage, GithubRateLimitDetails rateLimitDetails)
     {
-        var builder = new StringBuilder("GitHub API rate limit exceeded");
+        var builder = new StringBuilder($"GitHub {FormatRateLimitResource(rateLimitDetails.Resource)} rate limit exceeded");
+
+        if (rateLimitDetails.Remaining is not null || rateLimitDetails.Limit is not null)
+        {
+            builder.Append($". Remaining: {FormatRateLimitCount(rateLimitDetails.Remaining)}");
+            builder.Append($"; limit: {FormatRateLimitCount(rateLimitDetails.Limit)}");
+        }
 
         if (retryDelay > TimeSpan.Zero)
         {
@@ -462,6 +582,18 @@ internal sealed class GithubClient : IDisposable
         }
 
         return new HttpRequestException(builder.ToString(), null, statusCode);
+    }
+
+    private static string FormatRateLimitResource(string resource)
+    {
+        return string.IsNullOrWhiteSpace(resource)
+            ? "API"
+            : resource.Replace('_', ' ');
+    }
+
+    private static string FormatRateLimitCount(int? count)
+    {
+        return count?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown";
     }
 
     private static string FormatDelay(TimeSpan delay)
@@ -548,7 +680,31 @@ internal sealed class GithubContentResponse
     public string? Content { get; init; }
 }
 
+internal sealed class GithubRepositoryTreeResponse
+{
+    [JsonPropertyName("tree")]
+    public List<GithubRepositoryTreeEntry> Tree { get; init; } = [];
+
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; init; }
+}
+
+internal sealed record GithubRepositoryTreeEntry(
+    [property: JsonPropertyName("path")]
+    string? Path,
+
+    [property: JsonPropertyName("type")]
+    string? Type,
+
+    [property: JsonPropertyName("size")]
+    long? Size,
+
+    [property: JsonPropertyName("sha")]
+    string? Sha);
+
 internal sealed record GithubRateLimitState(int? Remaining, DateTimeOffset? ResetAt);
+
+internal sealed record GithubRateLimitDetails(string Resource, int? Remaining, int? Limit);
 
 internal sealed record GithubCodeSearchResult(
     [property: JsonPropertyName("name")]
@@ -596,6 +752,8 @@ internal sealed record GithubTextMatchOccurrence(
 [JsonSerializable(typeof(GithubCodeSearchResponse))]
 [JsonSerializable(typeof(GithubErrorResponse))]
 [JsonSerializable(typeof(GithubContentResponse))]
+[JsonSerializable(typeof(GithubRepositoryTreeResponse))]
+[JsonSerializable(typeof(GithubRepositoryTreeEntry))]
 internal sealed partial class GithubJsonSerializerContext : JsonSerializerContext
 {
 }

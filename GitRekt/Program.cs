@@ -15,20 +15,28 @@ var statusLine = new ConsoleStatusLine();
 try
 {
     var githubAccessToken = cliArguments.Token;
+    GithubAppInstallationAccessTokenProvider? githubAppAccessTokenProvider = null;
 
     if (string.IsNullOrWhiteSpace(githubAccessToken) && cliArguments.GithubAppAuthentication is not null)
     {
-        githubAccessToken = await GithubAppAuthenticator.CreateInstallationAccessTokenAsync(
+        githubAppAccessTokenProvider = new GithubAppInstallationAccessTokenProvider(
             cliArguments.GithubAppAuthentication,
             statusLine.Show);
+        githubAccessToken = await githubAppAccessTokenProvider.GetAccessTokenAsync();
     }
 
-    using var client = new GithubClient(githubAccessToken, showStatusMessage: statusLine.Show, clearStatusMessage: statusLine.Clear);
+    using var appTokenProvider = githubAppAccessTokenProvider;
+    using var client = new GithubClient(
+        githubAccessToken,
+        showStatusMessage: statusLine.Show,
+        clearStatusMessage: statusLine.Clear,
+        accessTokenProvider: appTokenProvider);
     using var aiValidationClient = AiValidationClientFactory.Create(cliArguments.AiValidation, client, statusLine.Show, statusLine.Clear);
     using var outputWriter = CreateOutputWriter(cliArguments.OutputPath);
     var isMultiQuery = cliArguments.Queries.Count > 1;
     var hasAiVerdictFilter = cliArguments.AiValidationVerdictFilter is not null;
     var useAiAgent = cliArguments.AiValidation?.UseAgent == true;
+    var aiValidationCache = new Dictionary<string, AiValidationCacheValue>(StringComparer.OrdinalIgnoreCase);
 
     foreach (var (query, queryIndex) in cliArguments.Queries.Select((query, index) => (query, index)))
     {
@@ -52,93 +60,51 @@ try
             }
 
             hasSearchResults = true;
+            var resultIndex = 0;
 
-            foreach (var result in searchPage.Items)
+            while (resultIndex < searchPage.Items.Count)
             {
-                AiValidationResult? validation = null;
-                string? aiValidationError = null;
+                var chunkValidationOutcomes = await ValidateNextSearchResultChunkAsync(
+                    aiValidationClient,
+                    query,
+                    cliArguments.UseAdvancedQuery,
+                    searchPage,
+                    resultIndex,
+                    validatedResultIndex,
+                    aiValidationCache);
+                validatedResultIndex = chunkValidationOutcomes.ValidatedResultIndex;
 
-                if (aiValidationClient is not null)
+                for (var chunkIndex = 0; chunkIndex < chunkValidationOutcomes.Outcomes.Length; chunkIndex++)
                 {
-                    try
+                    var result = searchPage.Items[resultIndex + chunkIndex];
+                    var validationOutcome = chunkValidationOutcomes.Outcomes[chunkIndex];
+                    var validation = validationOutcome?.Validation;
+
+                    if (validation is not null
+                        && hasAiVerdictFilter
+                        && !ShouldDisplayAiValidationVerdict(validation.Verdict, cliArguments.AiValidationVerdictFilter!.Value))
                     {
-                        validatedResultIndex++;
-                        validation = await aiValidationClient.ValidateAsync(
-                            query,
-                            cliArguments.UseAdvancedQuery,
-                            result,
-                            validatedResultIndex,
-                            searchPage.AvailableCount);
+                        continue;
                     }
-                    catch (Exception ex)
-                    {
-                        aiValidationError = ex.Message;
-                    }
+
+                    displayedResultIndex++;
+                    hasDisplayedResults = true;
+                    var header = hasAiVerdictFilter
+                        ? $"Result {validationOutcome?.ValidatedIndex ?? displayedResultIndex}/{searchPage.AvailableCount}"
+                        : $"Result {displayedResultIndex}/{searchPage.AvailableCount}";
+
+                    await WriteSearchResultAsync(
+                        client,
+                        result,
+                        validationOutcome,
+                        header,
+                        highlightTerms,
+                        useAiAgent,
+                        outputWriter,
+                        statusLine);
                 }
 
-                if (validation is not null
-                    && hasAiVerdictFilter
-                    && !ShouldDisplayAiValidationVerdict(validation.Verdict, cliArguments.AiValidationVerdictFilter!.Value))
-                {
-                    continue;
-                }
-
-                displayedResultIndex++;
-                hasDisplayedResults = true;
-                var header = hasAiVerdictFilter
-                    ? $"Result {validatedResultIndex}/{searchPage.AvailableCount}"
-                    : $"Result {displayedResultIndex}/{searchPage.AvailableCount}";
-
-                WriteHeaderBlock(header, outputWriter, statusLine, ConsoleColor.Cyan);
-
-                if (validation is not null)
-                {
-                    WriteAiValidationLine(validation, outputWriter, statusLine);
-
-                    if (useAiAgent && !string.IsNullOrWhiteSpace(validation.Evidence))
-                    {
-                        WriteAgentEvidenceLine(validation.Evidence, outputWriter, statusLine);
-                    }
-                }
-                else if (!string.IsNullOrWhiteSpace(aiValidationError))
-                {
-                    WriteAiValidationErrorLine(aiValidationError, outputWriter, statusLine);
-                }
-
-                if (!string.IsNullOrWhiteSpace(result.HtmlUrl))
-                {
-                    var resultUrl = await ResolveResultUrlAsync(client, result, highlightTerms, statusLine);
-                    WriteLabeledLine("Match", resultUrl, outputWriter, statusLine, ConsoleColor.Blue);
-                }
-
-                var snippetMatches = result.TextMatches?
-                    .Where(match =>
-                        !string.IsNullOrWhiteSpace(match.Fragment) &&
-                        !string.Equals(match.Property, "path", StringComparison.OrdinalIgnoreCase))
-                    .DistinctBy(match => $"{match.Property}\n{match.Fragment}")
-                    .ToList();
-
-                if (snippetMatches is not null && snippetMatches.Count > 0)
-                {
-                    WriteSectionLine("Snippets", outputWriter, statusLine, ConsoleColor.DarkYellow);
-
-                    foreach (var textMatch in snippetMatches)
-                    {
-                        statusLine.Clear();
-                        Console.Write("  • ");
-                        outputWriter?.Write("  • ");
-                        WriteHighlightedFragment(textMatch.Fragment!, textMatch.Matches, highlightTerms, outputWriter);
-                        Console.WriteLine();
-                        outputWriter?.WriteLine();
-                    }
-                }
-
-                if (useAiAgent && validation?.SensitiveItems is { Count: > 0 } sensitiveItems)
-                {
-                    await WriteAdditionalLeadsAsync(client, sensitiveItems, result.Repository, result.Path, outputWriter, statusLine);
-                }
-
-                WriteLine(string.Empty, outputWriter, statusLine);
+                resultIndex += chunkValidationOutcomes.Outcomes.Length;
             }
         }
 
@@ -182,6 +148,268 @@ static StreamWriter? CreateOutputWriter(string? outputPath)
     }
 
     return new StreamWriter(fullPath, append: false);
+}
+
+static async Task<AiValidationPageOutcomes> ValidateNextSearchResultChunkAsync(
+    IAiValidationClient? aiValidationClient,
+    string query,
+    bool useAdvancedQuery,
+    GithubCodeSearchPage searchPage,
+    int startIndex,
+    int validatedResultIndex,
+    Dictionary<string, AiValidationCacheValue> aiValidationCache)
+{
+    const int MaxStreamingRepositoryBatchSize = 8;
+
+    if (aiValidationClient is null)
+    {
+        return new AiValidationPageOutcomes([null], validatedResultIndex);
+    }
+
+    var firstResult = searchPage.Items[startIndex];
+    var firstCacheKey = CreateAiValidationCacheKey(query, useAdvancedQuery, firstResult);
+
+    if (aiValidationCache.TryGetValue(firstCacheKey, out var cachedValidation))
+    {
+        validatedResultIndex++;
+        return new AiValidationPageOutcomes(
+            [new AiValidationOutcome(cachedValidation.Validation, cachedValidation.Error, validatedResultIndex)],
+            validatedResultIndex);
+    }
+
+    if (aiValidationClient is not IAiRepositoryValidationClient repositoryValidationClient)
+    {
+        var cacheValue = await ValidateSingleResultAsync(
+            aiValidationClient,
+            query,
+            useAdvancedQuery,
+            firstResult,
+            validatedResultIndex + 1,
+            searchPage.AvailableCount);
+        aiValidationCache[firstCacheKey] = cacheValue;
+        validatedResultIndex++;
+        return new AiValidationPageOutcomes(
+            [new AiValidationOutcome(cacheValue.Validation, cacheValue.Error, validatedResultIndex)],
+            validatedResultIndex);
+    }
+
+    var pendingResults = CollectStreamingRepositoryBatch(
+        query,
+        useAdvancedQuery,
+        searchPage,
+        startIndex,
+        MaxStreamingRepositoryBatchSize,
+        aiValidationCache);
+
+    if (pendingResults.Count > 1)
+    {
+        try
+        {
+            var batchValidationResults = await repositoryValidationClient.ValidateRepositoryAsync(
+                query,
+                useAdvancedQuery,
+                pendingResults.Select(pending => pending.Result).ToList(),
+                validatedResultIndex + 1,
+                searchPage.AvailableCount);
+            var outcomes = new AiValidationOutcome?[pendingResults.Count];
+
+            for (var index = 0; index < pendingResults.Count; index++)
+            {
+                var pending = pendingResults[index];
+
+                if (!batchValidationResults.TryGetValue(pending.Result.Path, out var validation))
+                {
+                    outcomes = [];
+                    break;
+                }
+
+                var cacheValue = new AiValidationCacheValue(validation, null);
+                aiValidationCache[pending.CacheKey] = cacheValue;
+                validatedResultIndex++;
+                outcomes[index] = new AiValidationOutcome(validation, null, validatedResultIndex);
+            }
+
+            if (outcomes.Length > 0)
+            {
+                return new AiValidationPageOutcomes(outcomes, validatedResultIndex);
+            }
+        }
+        catch
+        {
+            // Fall back to single-result validation so the first result can be shown promptly.
+        }
+    }
+
+    var fallbackCacheValue = await ValidateSingleResultAsync(
+        aiValidationClient,
+        query,
+        useAdvancedQuery,
+        firstResult,
+        validatedResultIndex + 1,
+        searchPage.AvailableCount);
+    aiValidationCache[firstCacheKey] = fallbackCacheValue;
+    validatedResultIndex++;
+    return new AiValidationPageOutcomes(
+        [new AiValidationOutcome(fallbackCacheValue.Validation, fallbackCacheValue.Error, validatedResultIndex)],
+        validatedResultIndex);
+}
+
+static List<PendingAiValidationResult> CollectStreamingRepositoryBatch(
+    string query,
+    bool useAdvancedQuery,
+    GithubCodeSearchPage searchPage,
+    int startIndex,
+    int maxBatchSize,
+    Dictionary<string, AiValidationCacheValue> aiValidationCache)
+{
+    var firstResult = searchPage.Items[startIndex];
+    var repositoryFullName = firstResult.Repository.FullName;
+    var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var pendingResults = new List<PendingAiValidationResult>();
+
+    for (var index = startIndex; index < searchPage.Items.Count && pendingResults.Count < maxBatchSize; index++)
+    {
+        var result = searchPage.Items[index];
+
+        if (!string.Equals(result.Repository.FullName, repositoryFullName, StringComparison.OrdinalIgnoreCase))
+        {
+            break;
+        }
+
+        if (!seenPaths.Add(result.Path))
+        {
+            break;
+        }
+
+        var cacheKey = CreateAiValidationCacheKey(query, useAdvancedQuery, result);
+
+        if (aiValidationCache.ContainsKey(cacheKey))
+        {
+            break;
+        }
+
+        pendingResults.Add(new PendingAiValidationResult(index, result, cacheKey));
+    }
+
+    return pendingResults;
+}
+
+static async Task<AiValidationCacheValue> ValidateSingleResultAsync(
+    IAiValidationClient aiValidationClient,
+    string query,
+    bool useAdvancedQuery,
+    GithubCodeSearchResult result,
+    int progressCurrent,
+    int progressTotal)
+{
+    try
+    {
+        var validation = await aiValidationClient.ValidateAsync(
+            query,
+            useAdvancedQuery,
+            result,
+            progressCurrent,
+            progressTotal);
+        return new AiValidationCacheValue(validation, null);
+    }
+    catch (Exception ex)
+    {
+        return new AiValidationCacheValue(null, ex.Message);
+    }
+}
+
+static async Task WriteSearchResultAsync(
+    GithubClient client,
+    GithubCodeSearchResult result,
+    AiValidationOutcome? validationOutcome,
+    string header,
+    IReadOnlyList<string> highlightTerms,
+    bool useAiAgent,
+    TextWriter? outputWriter,
+    ConsoleStatusLine statusLine)
+{
+    var validation = validationOutcome?.Validation;
+    var aiValidationError = validationOutcome?.Error;
+
+    WriteHeaderBlock(header, outputWriter, statusLine, ConsoleColor.Cyan);
+
+    if (validation is not null)
+    {
+        WriteAiValidationLine(validation, outputWriter, statusLine);
+
+        if (useAiAgent && !string.IsNullOrWhiteSpace(validation.Evidence))
+        {
+            WriteAgentEvidenceLine(validation.Evidence, outputWriter, statusLine);
+        }
+    }
+    else if (!string.IsNullOrWhiteSpace(aiValidationError))
+    {
+        WriteAiValidationErrorLine(aiValidationError, outputWriter, statusLine);
+    }
+
+    if (!string.IsNullOrWhiteSpace(result.HtmlUrl))
+    {
+        var resultUrl = await ResolveResultUrlAsync(client, result, highlightTerms, statusLine);
+        WriteLabeledLine("Match", resultUrl, outputWriter, statusLine, ConsoleColor.Blue);
+    }
+
+    var snippetMatches = result.TextMatches?
+        .Where(match =>
+            !string.IsNullOrWhiteSpace(match.Fragment) &&
+            !string.Equals(match.Property, "path", StringComparison.OrdinalIgnoreCase))
+        .DistinctBy(match => $"{match.Property}\n{match.Fragment}")
+        .ToList();
+
+    if (snippetMatches is not null && snippetMatches.Count > 0)
+    {
+        WriteSectionLine("Snippets", outputWriter, statusLine, ConsoleColor.DarkYellow);
+
+        foreach (var textMatch in snippetMatches)
+        {
+            statusLine.Clear();
+            Console.Write("  ");
+            outputWriter?.Write("  ");
+            WriteHighlightedFragment(textMatch.Fragment!, textMatch.Matches, highlightTerms, outputWriter);
+            Console.WriteLine();
+            outputWriter?.WriteLine();
+        }
+    }
+
+    if (useAiAgent && validation?.SensitiveItems is { Count: > 0 } sensitiveItems)
+    {
+        await WriteAdditionalLeadsAsync(client, sensitiveItems, result.Repository, result.Path, outputWriter, statusLine);
+    }
+
+    WriteLine(string.Empty, outputWriter, statusLine);
+}
+
+static string CreateAiValidationCacheKey(string query, bool useAdvancedQuery, GithubCodeSearchResult result)
+{
+    return string.Join(
+        '\n',
+        useAdvancedQuery ? "advanced" : "simple",
+        query.Trim(),
+        result.Repository.FullName,
+        result.Path,
+        CreateSnippetSignature(result));
+}
+
+static string CreateSnippetSignature(GithubCodeSearchResult result)
+{
+    var snippets = (result.TextMatches?
+        .Where(match => !string.IsNullOrWhiteSpace(match.Fragment) && !string.Equals(match.Property, "path", StringComparison.OrdinalIgnoreCase))
+        .Select(match => NormalizeSnippet(match.Fragment!))
+        .Where(snippet => snippet.Length > 0)
+        .Distinct(StringComparer.Ordinal)
+        ?? [])
+        .Order(StringComparer.Ordinal);
+
+    return string.Join('\n', snippets);
+}
+
+static string NormalizeSnippet(string snippet)
+{
+    return string.Join(' ', snippet.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 }
 
 static void WriteLine(string value, TextWriter? outputWriter, ConsoleStatusLine statusLine)
@@ -748,3 +976,11 @@ internal sealed class ConsoleStatusLine
         }
     }
 }
+
+internal sealed record AiValidationCacheValue(AiValidationResult? Validation, string? Error);
+
+internal sealed record AiValidationOutcome(AiValidationResult? Validation, string? Error, int ValidatedIndex);
+
+internal sealed record AiValidationPageOutcomes(AiValidationOutcome?[] Outcomes, int ValidatedResultIndex);
+
+internal sealed record PendingAiValidationResult(int Index, GithubCodeSearchResult Result, string CacheKey);

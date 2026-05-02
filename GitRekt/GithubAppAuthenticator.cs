@@ -15,6 +15,15 @@ internal static class GithubAppAuthenticator
         Action<string>? showStatusMessage = null,
         CancellationToken cancellationToken = default)
     {
+        var tokenResponse = await CreateInstallationAccessTokenResponseAsync(configuration, showStatusMessage, cancellationToken);
+        return tokenResponse.Token;
+    }
+
+    public static async Task<GithubAppInstallationAccessToken> CreateInstallationAccessTokenResponseAsync(
+        GithubAppAuthenticationConfiguration configuration,
+        Action<string>? showStatusMessage = null,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(configuration);
 
         showStatusMessage?.Invoke("Authenticating GitHub App...");
@@ -50,7 +59,7 @@ internal static class GithubAppAuthenticator
             throw new InvalidOperationException("GitHub returned an installation token response without a token.");
         }
 
-        return tokenResponse.Token;
+        return new GithubAppInstallationAccessToken(tokenResponse.Token, tokenResponse.ExpiresAt);
     }
 
     private static async Task<string> ReadPrivateKeyAsync(GithubAppAuthenticationConfiguration configuration, CancellationToken cancellationToken)
@@ -205,6 +214,8 @@ internal sealed record GithubAppJwtPayload(
 
     [property: JsonPropertyName("iss")]
     string Issuer);
+
+internal sealed record GithubAppInstallationAccessToken(string Token, DateTimeOffset ExpiresAt);
 
 internal sealed class GithubAppInstallationsResponse
 {
