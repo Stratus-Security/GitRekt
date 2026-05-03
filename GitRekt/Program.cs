@@ -1,4 +1,5 @@
 ﻿using GitRekt;
+using System.Security.Cryptography;
 using System.Text;
 
 Console.OutputEncoding = Encoding.UTF8;
@@ -37,6 +38,7 @@ try
     var hasAiVerdictFilter = cliArguments.AiValidationVerdictFilter is not null;
     var useAiAgent = cliArguments.AiValidation?.UseAgent == true;
     var aiValidationCache = new Dictionary<string, AiValidationCacheValue>(StringComparer.OrdinalIgnoreCase);
+    var totalDisplayedResults = 0;
 
     foreach (var (query, queryIndex) in cliArguments.Queries.Select((query, index) => (query, index)))
     {
@@ -45,6 +47,7 @@ try
         var validatedResultIndex = 0;
         var hasSearchResults = false;
         var hasDisplayedResults = false;
+        var duplicateSignatures = new HashSet<string>(StringComparer.Ordinal);
 
         if (isMultiQuery)
         {
@@ -64,6 +67,12 @@ try
 
             while (resultIndex < searchPage.Items.Count)
             {
+                if (IsDuplicateResult(searchPage.Items[resultIndex], duplicateSignatures))
+                {
+                    resultIndex++;
+                    continue;
+                }
+
                 var chunkValidationOutcomes = await ValidateNextSearchResultChunkAsync(
                     aiValidationClient,
                     query,
@@ -71,6 +80,7 @@ try
                     searchPage,
                     resultIndex,
                     validatedResultIndex,
+                    duplicateSignatures,
                     aiValidationCache);
                 validatedResultIndex = chunkValidationOutcomes.ValidatedResultIndex;
 
@@ -88,6 +98,7 @@ try
                     }
 
                     displayedResultIndex++;
+                    totalDisplayedResults++;
                     hasDisplayedResults = true;
                     var header = hasAiVerdictFilter
                         ? $"Result {validationOutcome?.ValidatedIndex ?? displayedResultIndex}/{searchPage.AvailableCount}"
@@ -123,6 +134,8 @@ try
         }
     }
 
+    WriteCompletionSummary(totalDisplayedResults, aiValidationClient?.TokenUsage, outputWriter, statusLine);
+
     return 0;
 }
 catch (Exception ex)
@@ -150,6 +163,36 @@ static StreamWriter? CreateOutputWriter(string? outputPath)
     return new StreamWriter(fullPath, append: false);
 }
 
+static void WriteCompletionSummary(int displayedResultCount, AiTokenUsage? tokenUsage, TextWriter? outputWriter, ConsoleStatusLine statusLine)
+{
+    var resultText = displayedResultCount == 1
+        ? "1 result"
+        : $"{displayedResultCount.ToString(System.Globalization.CultureInfo.InvariantCulture)} results";
+
+    if (tokenUsage is null)
+    {
+        WriteColoredLine($"Done. Displayed {resultText}.", ConsoleColor.Cyan, outputWriter, statusLine);
+        return;
+    }
+
+    if (!tokenUsage.HasUsage)
+    {
+        WriteColoredLine($"Done. Displayed {resultText}. AI token usage was not reported by the provider.", ConsoleColor.Cyan, outputWriter, statusLine);
+        return;
+    }
+
+    WriteColoredLine(
+        $"Done. Displayed {resultText}. AI tokens: {FormatTokenCount(tokenUsage.TotalTokens)} total ({FormatTokenCount(tokenUsage.InputTokens)} input, {FormatTokenCount(tokenUsage.OutputTokens)} output).",
+        ConsoleColor.Cyan,
+        outputWriter,
+        statusLine);
+}
+
+static string FormatTokenCount(long tokenCount)
+{
+    return tokenCount.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+}
+
 static async Task<AiValidationPageOutcomes> ValidateNextSearchResultChunkAsync(
     IAiValidationClient? aiValidationClient,
     string query,
@@ -157,6 +200,7 @@ static async Task<AiValidationPageOutcomes> ValidateNextSearchResultChunkAsync(
     GithubCodeSearchPage searchPage,
     int startIndex,
     int validatedResultIndex,
+    HashSet<string> duplicateSignatures,
     Dictionary<string, AiValidationCacheValue> aiValidationCache)
 {
     const int MaxStreamingRepositoryBatchSize = 8;
@@ -199,6 +243,7 @@ static async Task<AiValidationPageOutcomes> ValidateNextSearchResultChunkAsync(
         searchPage,
         startIndex,
         MaxStreamingRepositoryBatchSize,
+        duplicateSignatures,
         aiValidationCache);
 
     if (pendingResults.Count > 1)
@@ -260,6 +305,7 @@ static List<PendingAiValidationResult> CollectStreamingRepositoryBatch(
     GithubCodeSearchPage searchPage,
     int startIndex,
     int maxBatchSize,
+    HashSet<string> duplicateSignatures,
     Dictionary<string, AiValidationCacheValue> aiValidationCache)
 {
     var firstResult = searchPage.Items[startIndex];
@@ -277,6 +323,11 @@ static List<PendingAiValidationResult> CollectStreamingRepositoryBatch(
         }
 
         if (!seenPaths.Add(result.Path))
+        {
+            break;
+        }
+
+        if (index != startIndex && IsDuplicateResult(result, duplicateSignatures))
         {
             break;
         }
@@ -412,6 +463,34 @@ static string NormalizeSnippet(string snippet)
     return string.Join(' ', snippet.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 }
 
+static string CreateResultDuplicateSignature(GithubCodeSearchResult result)
+{
+    var snippetSignature = CreateSnippetSignature(result);
+
+    if (string.IsNullOrWhiteSpace(snippetSignature))
+    {
+        return string.Empty;
+    }
+
+    var signatureBytes = Encoding.UTF8.GetBytes(string.Join('\n', result.Repository.FullName, snippetSignature));
+    var signatureHash = SHA256.HashData(signatureBytes);
+    return Convert.ToHexString(signatureHash.AsSpan(0, 16));
+}
+
+static bool IsDuplicateResult(GithubCodeSearchResult result, HashSet<string> duplicateSignatures)
+{
+    const int maxTrackedSignatures = 2048;
+
+    if (duplicateSignatures.Count >= maxTrackedSignatures)
+    {
+        return false;
+    }
+
+    var signature = CreateResultDuplicateSignature(result);
+
+    return !string.IsNullOrWhiteSpace(signature) && !duplicateSignatures.Add(signature);
+}
+
 static void WriteLine(string value, TextWriter? outputWriter, ConsoleStatusLine statusLine)
 {
     statusLine.Clear();
@@ -485,13 +564,23 @@ static async Task WriteAdditionalLeadsAsync(GithubClient client, IReadOnlyList<A
         };
 
         WriteColoredLine($"  • {verdictLabel}: {url}", GetAiValidationColor(item.Verdict), outputWriter, statusLine);
-        WriteLabeledLine("    Why", item.Reason, outputWriter, statusLine, ConsoleColor.Gray);
+        if (HasMeaningfulSensitiveItemReason(item.Reason))
+        {
+            WriteLabeledLine("    Why", item.Reason, outputWriter, statusLine, ConsoleColor.Gray);
+        }
 
         if (!string.IsNullOrWhiteSpace(item.Snippet))
         {
             WriteLabeledLine("    Snippet", item.Snippet, outputWriter, statusLine, ConsoleColor.DarkGray);
         }
     }
+}
+
+static bool HasMeaningfulSensitiveItemReason(string? reason)
+{
+    return !string.IsNullOrWhiteSpace(reason)
+        && !string.Equals(reason.Trim(), "Agent marked this item as sensitive.", StringComparison.OrdinalIgnoreCase)
+        && !reason.StartsWith("No item-specific reason was returned", StringComparison.OrdinalIgnoreCase);
 }
 
 static void WriteSectionLine(string title, TextWriter? outputWriter, ConsoleStatusLine statusLine, ConsoleColor color)
@@ -602,8 +691,12 @@ static string CreateRepositoryFileUrl(GithubCodeSearchRepository repository, str
     var repositoryUrl = !string.IsNullOrWhiteSpace(repository.HtmlUrl)
         ? repository.HtmlUrl
         : $"https://github.com/{repository.FullName}";
+    var branch = !string.IsNullOrWhiteSpace(repository.DefaultBranch)
+        ? repository.DefaultBranch
+        : "main";
+    var encodedBranch = string.Join('/', branch.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Uri.EscapeDataString));
     var encodedPath = string.Join('/', path.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Uri.EscapeDataString));
-    return AppendLineAnchor($"{repositoryUrl.TrimEnd('/')}/blob/HEAD/{encodedPath}", lineNumber);
+    return AppendLineAnchor($"{repositoryUrl.TrimEnd('/')}/blob/{encodedBranch}/{encodedPath}", lineNumber);
 }
 
 static string AppendLineAnchor(string url, int? lineNumber)

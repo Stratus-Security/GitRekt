@@ -1,65 +1,43 @@
 # GitRekt
 
-GitRekt is a GitHub code-search triage tool for finding possible exposed secrets, credentials, and sensitive configuration hints across public or authorized repositories.
+GitRekt helps you triage GitHub code-search results for exposed secrets, credentials, sensitive configuration, and high-risk personal data across public or authorized repositories.
 
-It wraps GitHub code search with practical output, line links, rate-limit handling, optional GitHub App authentication, and optional AI validation to reduce false positives.
+GitHub code search is powerful, but raw results are noisy: the same snippet can appear in many generated files, old exports, backups, fixtures, docs, or false-positive examples. GitRekt adds the workflow layer around search: direct file links, line resolution, duplicate reduction, rate-limit handling, optional GitHub App auth, and optional AI review that can explain why a match is worth looking at.
 
 > GitRekt is a triage tool. Treat findings as leads to review, not proof that a secret is valid or exploitable.
 
-## Features
+<img src="demo.gif" alt="GitRekt demo" width="1440">
+The above example is a useful use case when penetration testing. Simply search the customers domain (e.g. @domain.com) with AI and agent mode enabled for best results as seen here. This often finds valid credentials or leaked data for individual companies.
 
-- Search GitHub code with one or more queries.
-- Use simple search strings or pass advanced GitHub search syntax unchanged.
-- Print highlighted snippets and direct GitHub file links.
-- Resolve line numbers when possible.
-- Authenticate with a GitHub token or GitHub App installation token.
-- Refresh GitHub App installation tokens during long scans.
-- Handle GitHub primary and secondary rate limits with clearer wait/error messages.
-- Optionally validate results with AI:
-  - Ollama
-  - Ollama agent mode with same-repository evidence gathering
-  - Google Gemini
-  - OpenAI
-- Cache file content, repository trees, duplicate snippets, and AI validation work within a run.
-- Publish as NativeAOT single-file executables for Windows, Linux, and macOS.
+## When GitRekt Helps
+
+Use GitRekt when you already have a signal you want to investigate across GitHub:
+
+- leaked-looking passwords, tokens, API keys, client secrets, private keys, or connection strings,
+- company domains, internal hostnames, product names, customer names, or project codenames,
+- backup files, config files, `.env` files, CSV exports, logs, or migration dumps,
+- broad PII searches where you need to separate useful findings from ordinary public contact data,
+- periodic checks for accidental exposure across your own repositories or repositories you are authorized to review.
+
+## How It Works
+
+GitRekt runs GitHub code searches, streams matches as they are found, and prints readable results with direct GitHub links. When AI validation is enabled, each result is classified as `likely`, `possible`, or `none` so you can filter out obvious noise.
+
+Agent mode goes further: before classifying a match, GitRekt gathers repository context such as the matched file, high-signal companion files, and suspicious paths from the repository tree. This helps catch cases where the first match is only a clue, but a nearby `.env`, config backup, CSV export, or token-bearing file is the real issue.
+
+## What It Is Not
+
+GitRekt does not validate whether a credential still works, exploit findings, or replace secret-scanning in CI. It is best used as a discovery and triage layer for researchers, security teams, and maintainers who need to review GitHub search results quickly and consistently.
 
 ## Download
 
 Download prebuilt binaries from the [GitHub Releases page](https://github.com/Stratus-Security/GitRekt/releases).
-
-Release assets are built as NativeAOT single executables:
-
-- `gitrekt-win-x64.zip`
-- `gitrekt-linux-x64.tar.gz`
-- `gitrekt-osx-x64.tar.gz`
-- `gitrekt-osx-arm64.tar.gz`
 
 After extracting on Linux or macOS, make the binary executable if needed:
 
 ```bash
 chmod +x GitRekt
 ```
-
-## Build From Source
-
-Requirements:
-
-- .NET 10 SDK
-- NativeAOT prerequisites for your OS
-
-Build:
-
-```bash
-dotnet build GitRekt.slnx -c Release
-```
-
-Publish a local NativeAOT executable:
-
-```bash
-dotnet publish GitRekt/GitRekt.csproj -c Release -r linux-x64 --self-contained true -p:PublishAot=true -p:PublishSingleFile=true
-```
-
-Use the runtime identifier that matches your platform, for example `win-x64`, `linux-x64`, `osx-x64`, or `osx-arm64`.
 
 ## Basic Usage
 
@@ -93,22 +71,54 @@ Unauthenticated GitHub searches are very limited. For realistic use, authenticat
 
 ### Personal Access Token
 
+A fine-grained personal access token is the simplest option for individual use. Create one from [GitHub's personal access token settings](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token):
+
+1. Go to GitHub: **Settings** -> **Developer settings** -> **Personal access tokens** -> **Fine-grained tokens**.
+2. Click **Generate new token**.
+3. Choose the owner and repositories GitRekt should be allowed to search.
+4. Set repository permissions:
+   - **Contents**: **Read-only**
+   - **Metadata**: **Read-only** if GitHub shows it as configurable; GitHub often includes metadata access automatically.
+5. Generate the token and store it somewhere safe. GitHub only shows it once.
+
 Set an environment variable:
 
 ```bash
-export GITHUB_ACCESS_TOKEN="ghp_..."
+export GITHUB_ACCESS_TOKEN="github_pat_..."
 GitRekt --query "Password1"
 ```
 
 Or pass it directly:
 
 ```bash
-GitRekt --token "ghp_..." --query "Password1"
+GitRekt --token "github_pat_..." --query "Password1"
 ```
+
+If you must use a classic token, use the smallest scope that works for your target repositories. Private repository searches generally require the broader `repo` scope.
 
 ### GitHub App
 
 GitHub App auth is a better fit for longer scans because installation tokens can be refreshed and scoped to the installed account.
+
+Create the app from [GitHub's GitHub App registration page](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app):
+
+1. Go to GitHub: **Settings** -> **Developer settings** -> **GitHub Apps** -> **New GitHub App**. For an organization-owned app, use the organization's settings instead.
+2. Give it a clear name, such as `GitRekt Scanner`.
+3. Set **Homepage URL** to your project, company, or repository URL.
+4. Disable **Active** webhooks unless you need them for something else. GitRekt does not need webhooks.
+5. Set repository permissions:
+   - **Contents**: **Read-only**
+   - **Metadata**: **Read-only**
+6. Do not subscribe to webhook events.
+7. Choose where the app can be installed:
+   - **Only on this account** for personal/internal use.
+   - **Any account** if other organizations should install it.
+8. Click **Create GitHub App**.
+9. Copy the **App ID** from the app's **General** page.
+10. Under **Private keys**, click **Generate a private key** and download the `.pem` file.
+11. Click **Install App** and install it on the account or repositories GitRekt should scan.
+
+If the app has multiple installations, copy the installation ID from the installed app URL. It is the numeric ID in a URL like `https://github.com/settings/installations/12345678`.
 
 Set:
 
@@ -121,6 +131,8 @@ GitRekt --query "Password1"
 ```
 
 If the app has exactly one installation, `GITHUB_APP_INSTALLATION_ID` is optional. GitRekt can also pick up exactly one `*.private-key.pem` file from the current directory when `GITHUB_APP_ID` is set.
+
+GitHub App installation tokens are short-lived; GitRekt creates and refreshes them from the app ID, installation ID, and private key. The app does not bypass GitHub code-search rate limits, but it gives cleaner per-installation scoping and avoids long-lived user credentials.
 
 Equivalent CLI flags:
 
@@ -136,21 +148,35 @@ GitRekt \
 
 AI validation can classify each displayed result as:
 
-- `likely_sensitive`
-- `possible_sensitive_lead`
-- `no_sensitive_evidence`
+- `likely`
+- `possible`
+- `none`
 
-You can filter output by verdict:
+You can filter the output by verdict, which includes more sensitive verdicts too:
 
 ```bash
-GitRekt --query "Password1" --ai --ai-model llama3.2 --ai-verdict yellow
+GitRekt --query "Password1" --ai --ai-model llama3.2 --ai-verdict possible
+```
+This example command shows sensitive and potentially sensitive results but hides any that aren't considered sensitive by the AI.
+
+Use strict mode when broad PII-style searches produce too many ordinary business contact matches:
+
+```bash
+GitRekt --query "@example.com" --ai --strict --ai-model llama3.2 --ai-verdict possible
 ```
 
-Verdict aliases:
+Strict mode treats marketing lists, public staff directories, and ordinary work contact details such as name, company, email, job title, and office phone as low signal. It still keeps higher-impact findings such as credentials, tokens, private keys, home addresses, government IDs, dates of birth, salary or compensation data, financial data, medical data, personal account data, and private customer records.
 
-- `likely`, `red`
-- `possible`, `yellow`
-- `none`, `green`
+### Agent Mode
+
+Agent mode gathers same-repository context before validation. It works with every AI by adding matched file excerpts and high-signal repository candidates before asking the model to classify the result.
+The agent also looks for other sensitive files within the repo, automagically finding secrets, PII, etc that may be leaked relating to a matching keyword.
+
+> Note: This mode uses more tokens, plain AI mode simply classifies the context from GitHub search.
+
+```bash
+GitRekt --query "Password1" --ai-agent --ai-model llama3.2 --ai-verdict possible
+```
 
 ### Ollama
 
@@ -159,14 +185,6 @@ Ollama is the default AI provider.
 ```bash
 GitRekt --query "Password1" --ai --ai-model llama3.2
 ```
-
-Agent mode lets the model inspect same-repository context using bounded read-only tools:
-
-```bash
-GitRekt --query "Password1" --ai-agent --ai-model llama3.2 --ai-verdict yellow
-```
-
-Agent mode is currently Ollama-only.
 
 ### Gemini
 
@@ -203,19 +221,6 @@ GitHub code search has a small rate-limit bucket compared with many other GitHub
 
 For heavier use, prefer a GitHub App installed per customer or organization. Avoid running many customers through one shared GitHub credential.
 
-## Exit Behavior
+## Acknowledgements
 
-GitRekt exits non-zero for fatal setup or GitHub API errors, such as invalid credentials. Individual AI validation failures are printed next to the affected result so the scan can continue.
-
-## Security Notes
-
-- Do not commit GitHub App private keys or API keys.
-- Prefer environment variables or secret stores for credentials.
-- Review findings manually before rotating credentials or opening incidents.
-- Some matches are intentionally reported as leads because surrounding repository context may matter.
-
-## Releases
-
-Releases are created automatically on pushes to the repository's default branch by the [Release workflow](https://github.com/Stratus-Security/GitRekt/actions/workflows/release.yml).
-
-Each release contains NativeAOT builds for Windows, Linux, and macOS.
+GitRekt was inspired in part by Bishop Fox's [GitGot](https://github.com/BishopFox/GitGot), a long-standing GitHub secret-search tool.

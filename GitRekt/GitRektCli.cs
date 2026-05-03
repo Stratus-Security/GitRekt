@@ -40,7 +40,7 @@ internal static class GitRektCli
 
         var validateAiOption = new Option<bool>("--ai", "Validate each displayed result with AI.");
 
-        var aiAgentOption = new Option<bool>("--ai-agent", "Use Microsoft Agent Framework to gather same-repository evidence before AI validation.");
+        var aiAgentOption = new Option<bool>("--ai-agent", "Gather same-repository evidence before AI validation.");
 
         var aiProviderOption = new Option<string?>("--ai-provider", "AI provider for validation. Defaults to ollama. Supported: ollama, gemini, openai.");
 
@@ -50,12 +50,14 @@ internal static class GitRektCli
         aiApiKeyOption.AddAlias("--gemini-api-key");
         aiApiKeyOption.AddAlias("--openai-api-key");
 
-        var aiVerdictOption = new Option<string?>("--ai-verdict", "Only show AI validation verdicts at or above this category. Values: likely/red, possible/yellow, none/green.")
+        var aiVerdictOption = new Option<string?>("--ai-verdict", "Only show AI validation verdicts at or above this category. Values: likely, possible, none.")
         {
             Arity = ArgumentArity.ZeroOrOne
         };
         aiVerdictOption.AddAlias("--ai-category");
         aiVerdictOption.AddAlias("--ai-show");
+
+        var strictOption = new Option<bool>("--strict", "Use stricter AI validation. Ordinary business contact lists are treated as low signal unless stronger sensitive data is present.");
 
         var rootCommand = new RootCommand("""
 Search GitHub code.
@@ -67,8 +69,9 @@ Examples:
   GitRekt --query "Password1" --query "Password2"
   GitRekt --advanced --query "\"Password1\" language:C# path:/src/" --query "\"Password2\" language:C#"
   GitRekt --query "Password1" --ai --ai-model llama3.2
-  GitRekt --query "Password1" --ai --ai-model llama3.2 --ai-verdict yellow
-  GitRekt --query "Password1" --ai --ai-agent --ai-model llama3.2 --ai-verdict yellow
+  GitRekt --query "Password1" --ai --ai-model llama3.2 --ai-verdict possible
+  GitRekt --query "@example.com" --ai --strict --ai-model llama3.2 --ai-verdict possible
+  GitRekt --query "Password1" --ai --ai-agent --ai-model llama3.2 --ai-verdict possible
   GitRekt --query "Password1" --ai-provider gemini --ai-model gemini-2.5-flash
   GitRekt --query "Password1" --ai-provider openai --ai-model gpt-5-mini
   GitRekt --github-app-id 12345 --github-app-private-key-path app.pem --query "Password1"
@@ -88,6 +91,7 @@ Examples:
         rootCommand.AddOption(aiModelOption);
         rootCommand.AddOption(aiApiKeyOption);
         rootCommand.AddOption(aiVerdictOption);
+        rootCommand.AddOption(strictOption);
         rootCommand.AddValidator(parseResult =>
         {
             if (IsHelpRequested(args))
@@ -109,8 +113,9 @@ Examples:
             var hasAiModel = parseResult.FindResultFor(aiModelOption) is not null;
             var hasAiApiKey = parseResult.FindResultFor(aiApiKeyOption) is not null;
             var hasAiVerdictFilter = !string.IsNullOrWhiteSpace(parseResult.GetValueForOption(aiVerdictOption));
+            var hasStrict = parseResult.GetValueForOption(strictOption);
 
-            if (!hasAiFlag && !hasAiAgentFlag && !hasAiProvider && !hasAiModel && !hasAiApiKey && !hasAiVerdictFilter)
+            if (!hasAiFlag && !hasAiAgentFlag && !hasAiProvider && !hasAiModel && !hasAiApiKey && !hasAiVerdictFilter && !hasStrict)
             {
                 return;
             }
@@ -128,14 +133,6 @@ Examples:
             if (!IsSupportedAiProvider(aiProvider))
             {
                 parseResult.ErrorMessage = "Unsupported --ai-provider value. Supported: ollama, gemini, openai.";
-                return;
-            }
-
-            if (parseResult.GetValueForOption(aiAgentOption)
-                && !string.IsNullOrWhiteSpace(aiProvider)
-                && !string.Equals(aiProvider, "ollama", StringComparison.OrdinalIgnoreCase))
-            {
-                parseResult.ErrorMessage = "--ai-agent is currently only supported with --ai-provider ollama.";
                 return;
             }
 
@@ -169,7 +166,7 @@ Examples:
             if (!string.IsNullOrWhiteSpace(aiVerdict)
                 && !TryParseAiValidationVerdict(aiVerdict, out _))
             {
-                parseResult.ErrorMessage = $"Unsupported --ai-verdict value '{aiVerdict}'. Supported values: likely/red, possible/yellow, none/green.";
+                parseResult.ErrorMessage = $"Unsupported --ai-verdict value '{aiVerdict}'. Supported values: likely, possible, none.";
                 return;
             }
         });
@@ -191,13 +188,15 @@ Examples:
             var aiModel = parseResult.GetValueForOption(aiModelOption);
             var aiApiKey = parseResult.GetValueForOption(aiApiKeyOption);
             var aiVerdicts = parseResult.GetValueForOption(aiVerdictOption);
+            var strictMode = parseResult.GetValueForOption(strictOption);
             var aiVerdictFilter = ParseAiValidationVerdict(aiVerdicts);
             var shouldValidateAi = validateAi
                 || useAiAgent
                 || !string.IsNullOrWhiteSpace(aiProvider)
                 || !string.IsNullOrWhiteSpace(aiModel)
                 || !string.IsNullOrWhiteSpace(aiApiKey)
-                || aiVerdictFilter is not null;
+                || aiVerdictFilter is not null
+                || strictMode;
 
             if (queries.Length == 0)
             {
@@ -215,11 +214,6 @@ Examples:
             }
 
             aiProvider = string.IsNullOrWhiteSpace(aiProvider) ? "ollama" : aiProvider;
-
-            if (useAiAgent && !string.Equals(aiProvider, "ollama", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException("--ai-agent is currently only supported with --ai-provider ollama.");
-            }
 
             aiApiKey ??= string.Equals(aiProvider, "gemini", StringComparison.OrdinalIgnoreCase)
                 ? Environment.GetEnvironmentVariable("GEMINI_API_KEY") ?? Environment.GetEnvironmentVariable("GOOGLE_API_KEY")
@@ -269,6 +263,7 @@ Examples:
                         aiProvider,
                         aiModel!,
                         useAiAgent,
+                        strictMode,
                         aiApiKey)
                     : null,
                 aiVerdictFilter);
@@ -312,7 +307,7 @@ Examples:
 
         return TryParseAiValidationVerdict(value, out var verdict)
             ? verdict
-            : throw new InvalidOperationException($"Unsupported --ai-verdict value '{value}'. Supported values: likely/red, possible/yellow, none/green.");
+            : throw new InvalidOperationException($"Unsupported --ai-verdict value '{value}'. Supported values: likely, possible, none.");
     }
 
     private static bool TryParseAiValidationVerdict(string? value, out AiValidationVerdict verdict)
@@ -449,12 +444,13 @@ Options:
   -o, --output <path>                         Write output to a file.
   --advanced, --raw-query                     Pass each query to GitHub code search unchanged.
   --ai                                        Validate each displayed result with AI.
-  --ai-agent                                  Use Microsoft Agent Framework to gather same-repository evidence before AI validation.
+  --ai-agent                                  Gather same-repository evidence before AI validation.
   --ai-provider <provider>                    AI provider for validation. Supported: ollama, gemini, openai.
   --ai-model <model>                          Model name used for AI validation.
   --ai-api-key, --gemini-api-key, --openai-api-key <key>
                                                AI provider API key. For Gemini, defaults to GEMINI_API_KEY or GOOGLE_API_KEY. For OpenAI, defaults to OPENAI_API_KEY.
-  --ai-verdict <verdict>                      Only show AI verdicts at or above likely/red, possible/yellow, or none/green.
+  --ai-verdict <verdict>                      Only show AI verdicts at or above likely, possible, or none.
+  --strict                                    Use stricter AI validation. Ordinary business contact lists and low value PII are ignored.
   -h, --help                                  Show help.
 
 Examples:

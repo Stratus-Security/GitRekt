@@ -727,7 +727,10 @@ internal sealed record GithubCodeSearchRepository(
     string FullName,
 
     [property: JsonPropertyName("html_url")]
-    string? HtmlUrl);
+    string? HtmlUrl,
+
+    [property: JsonPropertyName("default_branch")]
+    string? DefaultBranch = null);
 
 internal sealed record GithubTextMatch(
     [property: JsonPropertyName("object_type")]
