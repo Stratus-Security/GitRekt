@@ -1,4 +1,4 @@
-﻿using GitRekt;
+using GitRekt;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -23,7 +23,6 @@ try
         githubAppAccessTokenProvider = new GithubAppInstallationAccessTokenProvider(
             cliArguments.GithubAppAuthentication,
             statusLine.Show);
-        githubAccessToken = await githubAppAccessTokenProvider.GetAccessTokenAsync();
     }
 
     using var appTokenProvider = githubAppAccessTokenProvider;
@@ -35,6 +34,7 @@ try
     using var aiValidationClient = AiValidationClientFactory.Create(cliArguments.AiValidation, client, statusLine.Show, statusLine.Clear);
     using var outputWriter = CreateOutputWriter(cliArguments.OutputPath);
     var isMultiQuery = cliArguments.Queries.Count > 1;
+    var isMultiSource = cliArguments.SearchSources.Count > 1;
     var hasAiVerdictFilter = cliArguments.AiValidationVerdictFilter is not null;
     var useAiAgent = cliArguments.AiValidation?.UseAgent == true;
     var aiValidationCache = new Dictionary<string, AiValidationCacheValue>(StringComparer.OrdinalIgnoreCase);
@@ -55,73 +55,80 @@ try
             WriteHeaderBlock(queryHeader, outputWriter, statusLine, ConsoleColor.Cyan);
         }
 
-        await foreach (var searchPage in client.SearchCodePagesAsync(query, cliArguments.UseAdvancedQuery))
+        foreach (var source in cliArguments.SearchSources)
         {
-            if (searchPage.Items.Count == 0)
+            await foreach (var searchPage in SearchSourcePagesAsync(client, source, query, cliArguments.UseAdvancedQuery))
             {
-                continue;
-            }
-
-            hasSearchResults = true;
-            var resultIndex = 0;
-
-            while (resultIndex < searchPage.Items.Count)
-            {
-                if (IsDuplicateResult(searchPage.Items[resultIndex], duplicateSignatures))
+                if (searchPage.Items.Count == 0)
                 {
-                    resultIndex++;
                     continue;
                 }
 
-                var chunkValidationOutcomes = await ValidateNextSearchResultChunkAsync(
-                    aiValidationClient,
-                    query,
-                    cliArguments.UseAdvancedQuery,
-                    searchPage,
-                    resultIndex,
-                    validatedResultIndex,
-                    duplicateSignatures,
-                    aiValidationCache);
-                validatedResultIndex = chunkValidationOutcomes.ValidatedResultIndex;
+                hasSearchResults = true;
+                var resultIndex = 0;
 
-                for (var chunkIndex = 0; chunkIndex < chunkValidationOutcomes.Outcomes.Length; chunkIndex++)
+                while (resultIndex < searchPage.Items.Count)
                 {
-                    var result = searchPage.Items[resultIndex + chunkIndex];
-                    var validationOutcome = chunkValidationOutcomes.Outcomes[chunkIndex];
-                    var validation = validationOutcome?.Validation;
-
-                    if (validation is not null
-                        && hasAiVerdictFilter
-                        && !ShouldDisplayAiValidationVerdict(validation.Verdict, cliArguments.AiValidationVerdictFilter!.Value))
+                    if (IsDuplicateResult(searchPage.Items[resultIndex], duplicateSignatures))
                     {
+                        resultIndex++;
                         continue;
                     }
 
-                    displayedResultIndex++;
-                    totalDisplayedResults++;
-                    hasDisplayedResults = true;
-                    var header = hasAiVerdictFilter
-                        ? $"Result {validationOutcome?.ValidatedIndex ?? displayedResultIndex}/{searchPage.AvailableCount}"
-                        : $"Result {displayedResultIndex}/{searchPage.AvailableCount}";
+                    var chunkValidationOutcomes = await ValidateNextSearchResultChunkAsync(
+                        aiValidationClient,
+                        query,
+                        cliArguments.UseAdvancedQuery,
+                        searchPage,
+                        resultIndex,
+                        validatedResultIndex,
+                        duplicateSignatures,
+                        aiValidationCache);
+                    validatedResultIndex = chunkValidationOutcomes.ValidatedResultIndex;
 
-                    await WriteSearchResultAsync(
-                        client,
-                        result,
-                        validationOutcome,
-                        header,
-                        highlightTerms,
-                        useAiAgent,
-                        outputWriter,
-                        statusLine);
+                    for (var chunkIndex = 0; chunkIndex < chunkValidationOutcomes.Outcomes.Length; chunkIndex++)
+                    {
+                        var result = searchPage.Items[resultIndex + chunkIndex];
+                        var validationOutcome = chunkValidationOutcomes.Outcomes[chunkIndex];
+                        var validation = validationOutcome?.Validation;
+
+                        if (validation is not null
+                            && hasAiVerdictFilter
+                            && !ShouldDisplayAiValidationVerdict(validation.Verdict, cliArguments.AiValidationVerdictFilter!.Value))
+                        {
+                            continue;
+                        }
+
+                        displayedResultIndex++;
+                        totalDisplayedResults++;
+                        hasDisplayedResults = true;
+                        var header = CreateResultHeader(
+                            result,
+                            displayedResultIndex,
+                            validationOutcome?.ValidatedIndex,
+                            searchPage.AvailableCount,
+                            hasAiVerdictFilter,
+                            isMultiSource);
+
+                        await WriteSearchResultAsync(
+                            client,
+                            result,
+                            validationOutcome,
+                            header,
+                            highlightTerms,
+                            useAiAgent,
+                            outputWriter,
+                            statusLine);
+                    }
+
+                    resultIndex += chunkValidationOutcomes.Outcomes.Length;
                 }
-
-                resultIndex += chunkValidationOutcomes.Outcomes.Length;
             }
         }
 
         if (!hasSearchResults)
         {
-            WriteLine(isMultiQuery ? $"No code matches found for \"{query}\"." : "No code matches found.", outputWriter, statusLine);
+            WriteLine(isMultiQuery ? $"No matches found for \"{query}\"." : "No matches found.", outputWriter, statusLine);
         }
         else if (!hasDisplayedResults)
         {
@@ -175,12 +182,6 @@ static void WriteCompletionSummary(int displayedResultCount, AiTokenUsage? token
         return;
     }
 
-    if (!tokenUsage.HasUsage)
-    {
-        WriteColoredLine($"Done. Displayed {resultText}. AI token usage was not reported by the provider.", ConsoleColor.Cyan, outputWriter, statusLine);
-        return;
-    }
-
     WriteColoredLine(
         $"Done. Displayed {resultText}. AI tokens: {FormatTokenCount(tokenUsage.TotalTokens)} total ({FormatTokenCount(tokenUsage.InputTokens)} input, {FormatTokenCount(tokenUsage.OutputTokens)} output).",
         ConsoleColor.Cyan,
@@ -191,6 +192,35 @@ static void WriteCompletionSummary(int displayedResultCount, AiTokenUsage? token
 static string FormatTokenCount(long tokenCount)
 {
     return tokenCount.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+}
+
+static IAsyncEnumerable<GithubCodeSearchPage> SearchSourcePagesAsync(GithubClient client, GithubSearchSource source, string query, bool useAdvancedQuery)
+{
+    return source switch
+    {
+        GithubSearchSource.Gists => client.SearchGistPagesAsync(query, useAdvancedQuery),
+        _ => client.SearchCodePagesAsync(query, useAdvancedQuery)
+    };
+}
+
+static string CreateResultHeader(
+    GithubSearchResult result,
+    int displayedResultIndex,
+    int? validatedResultIndex,
+    int availableCount,
+    bool hasAiVerdictFilter,
+    bool isMultiSource)
+{
+    var resultIndex = hasAiVerdictFilter
+        ? validatedResultIndex ?? displayedResultIndex
+        : displayedResultIndex;
+
+    if (isMultiSource || result.Source == GithubSearchSource.Gists || availableCount <= 0)
+    {
+        return $"Result {resultIndex} ({FormatSearchSource(result.Source)})";
+    }
+
+    return $"Result {resultIndex}/{availableCount}";
 }
 
 static async Task<AiValidationPageOutcomes> ValidateNextSearchResultChunkAsync(
@@ -221,7 +251,9 @@ static async Task<AiValidationPageOutcomes> ValidateNextSearchResultChunkAsync(
             validatedResultIndex);
     }
 
-    if (aiValidationClient is not IAiRepositoryValidationClient repositoryValidationClient)
+    if (firstResult.Source != GithubSearchSource.Repositories
+        || firstResult.Repository is null
+        || aiValidationClient is not IAiRepositoryValidationClient repositoryValidationClient)
     {
         var cacheValue = await ValidateSingleResultAsync(
             aiValidationClient,
@@ -309,15 +341,20 @@ static List<PendingAiValidationResult> CollectStreamingRepositoryBatch(
     Dictionary<string, AiValidationCacheValue> aiValidationCache)
 {
     var firstResult = searchPage.Items[startIndex];
-    var repositoryFullName = firstResult.Repository.FullName;
+    var repositoryFullName = firstResult.Repository?.FullName;
     var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     var pendingResults = new List<PendingAiValidationResult>();
+
+    if (string.IsNullOrWhiteSpace(repositoryFullName))
+    {
+        return pendingResults;
+    }
 
     for (var index = startIndex; index < searchPage.Items.Count && pendingResults.Count < maxBatchSize; index++)
     {
         var result = searchPage.Items[index];
 
-        if (!string.Equals(result.Repository.FullName, repositoryFullName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(result.Repository?.FullName, repositoryFullName, StringComparison.OrdinalIgnoreCase))
         {
             break;
         }
@@ -349,7 +386,7 @@ static async Task<AiValidationCacheValue> ValidateSingleResultAsync(
     IAiValidationClient aiValidationClient,
     string query,
     bool useAdvancedQuery,
-    GithubCodeSearchResult result,
+    GithubSearchResult result,
     int progressCurrent,
     int progressTotal)
 {
@@ -371,7 +408,7 @@ static async Task<AiValidationCacheValue> ValidateSingleResultAsync(
 
 static async Task WriteSearchResultAsync(
     GithubClient client,
-    GithubCodeSearchResult result,
+    GithubSearchResult result,
     AiValidationOutcome? validationOutcome,
     string header,
     IReadOnlyList<string> highlightTerms,
@@ -383,6 +420,7 @@ static async Task WriteSearchResultAsync(
     var aiValidationError = validationOutcome?.Error;
 
     WriteHeaderBlock(header, outputWriter, statusLine, ConsoleColor.Cyan);
+    WriteLabeledLine("Source", FormatSearchSource(result.Source), outputWriter, statusLine, ConsoleColor.DarkGray);
 
     if (validation is not null)
     {
@@ -428,24 +466,25 @@ static async Task WriteSearchResultAsync(
 
     if (useAiAgent && validation?.SensitiveItems is { Count: > 0 } sensitiveItems)
     {
-        await WriteAdditionalLeadsAsync(client, sensitiveItems, result.Repository, result.Path, outputWriter, statusLine);
+        await WriteAdditionalLeadsAsync(client, sensitiveItems, result, outputWriter, statusLine);
     }
 
     WriteLine(string.Empty, outputWriter, statusLine);
 }
 
-static string CreateAiValidationCacheKey(string query, bool useAdvancedQuery, GithubCodeSearchResult result)
+static string CreateAiValidationCacheKey(string query, bool useAdvancedQuery, GithubSearchResult result)
 {
     return string.Join(
         '\n',
         useAdvancedQuery ? "advanced" : "simple",
         query.Trim(),
-        result.Repository.FullName,
+        result.Source.ToString(),
+        result.ContainerName,
         result.Path,
         CreateSnippetSignature(result));
 }
 
-static string CreateSnippetSignature(GithubCodeSearchResult result)
+static string CreateSnippetSignature(GithubSearchResult result)
 {
     var snippets = (result.TextMatches?
         .Where(match => !string.IsNullOrWhiteSpace(match.Fragment) && !string.Equals(match.Property, "path", StringComparison.OrdinalIgnoreCase))
@@ -463,7 +502,7 @@ static string NormalizeSnippet(string snippet)
     return string.Join(' ', snippet.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 }
 
-static string CreateResultDuplicateSignature(GithubCodeSearchResult result)
+static string CreateResultDuplicateSignature(GithubSearchResult result)
 {
     var snippetSignature = CreateSnippetSignature(result);
 
@@ -472,12 +511,12 @@ static string CreateResultDuplicateSignature(GithubCodeSearchResult result)
         return string.Empty;
     }
 
-    var signatureBytes = Encoding.UTF8.GetBytes(string.Join('\n', result.Repository.FullName, snippetSignature));
+    var signatureBytes = Encoding.UTF8.GetBytes(string.Join('\n', result.Source.ToString(), result.ContainerName, snippetSignature));
     var signatureHash = SHA256.HashData(signatureBytes);
     return Convert.ToHexString(signatureHash.AsSpan(0, 16));
 }
 
-static bool IsDuplicateResult(GithubCodeSearchResult result, HashSet<string> duplicateSignatures)
+static bool IsDuplicateResult(GithubSearchResult result, HashSet<string> duplicateSignatures)
 {
     const int maxTrackedSignatures = 2048;
 
@@ -529,12 +568,12 @@ static void WriteAgentEvidenceLine(string evidence, TextWriter? outputWriter, Co
     WriteLabeledLine("Evidence", evidence, outputWriter, statusLine, ConsoleColor.DarkCyan);
 }
 
-static async Task WriteAdditionalLeadsAsync(GithubClient client, IReadOnlyList<AiSensitiveItem> sensitiveItems, GithubCodeSearchRepository repository, string primaryPath, TextWriter? outputWriter, ConsoleStatusLine statusLine)
+static async Task WriteAdditionalLeadsAsync(GithubClient client, IReadOnlyList<AiSensitiveItem> sensitiveItems, GithubSearchResult result, TextWriter? outputWriter, ConsoleStatusLine statusLine)
 {
     var distinctItems = sensitiveItems
         .Where(item =>
             !string.IsNullOrWhiteSpace(item.Path)
-            && !string.Equals(item.Path, primaryPath, StringComparison.OrdinalIgnoreCase))
+            && !string.Equals(item.Path, result.Path, StringComparison.OrdinalIgnoreCase))
         .DistinctBy(item => $"{item.Path}\n{item.LineNumber}\n{item.Reason}")
         .ToList();
 
@@ -548,14 +587,8 @@ static async Task WriteAdditionalLeadsAsync(GithubClient client, IReadOnlyList<A
     foreach (var item in distinctItems)
     {
         var lineNumber = item.LineNumber
-            ?? await TryResolveRepositoryFileLineNumberAsync(
-                client,
-                repository.FullName,
-                item.Path,
-                GetSensitiveItemLineSearchTerms(item),
-                statusLine,
-                "Resolving additional lead");
-        var url = CreateRepositoryFileUrl(repository, item.Path, lineNumber);
+            ?? await TryResolveAdditionalLeadLineNumberAsync(client, result, item, statusLine);
+        var url = CreateAdditionalLeadUrl(result, item.Path, lineNumber);
         var verdictLabel = item.Verdict switch
         {
             AiValidationVerdict.LikelySensitive => "likely sensitive",
@@ -574,6 +607,46 @@ static async Task WriteAdditionalLeadsAsync(GithubClient client, IReadOnlyList<A
             WriteLabeledLine("    Snippet", item.Snippet, outputWriter, statusLine, ConsoleColor.DarkGray);
         }
     }
+}
+
+static async Task<int?> TryResolveAdditionalLeadLineNumberAsync(GithubClient client, GithubSearchResult result, AiSensitiveItem item, ConsoleStatusLine statusLine)
+{
+    if (result.Source == GithubSearchSource.Gists && result.Gist is not null)
+    {
+        statusLine.Show($"Resolving additional lead line number for {result.Gist.DisplayName}/{FormatPathForStatus(item.Path)}...");
+        return await client.TryFindGistFileLineNumberAsync(result.Gist.Id, item.Path, GetSensitiveItemLineSearchTerms(item));
+    }
+
+    if (result.Repository is not null)
+    {
+        return await TryResolveRepositoryFileLineNumberAsync(
+            client,
+            result.Repository.FullName,
+            item.Path,
+            GetSensitiveItemLineSearchTerms(item),
+            statusLine,
+            "Resolving additional lead");
+    }
+
+    return null;
+}
+
+static string CreateAdditionalLeadUrl(GithubSearchResult result, string path, int? lineNumber)
+{
+    if (result.Source == GithubSearchSource.Gists && result.Gist is not null)
+    {
+        var baseUrl = !string.IsNullOrWhiteSpace(result.Gist.HtmlUrl)
+            ? result.Gist.HtmlUrl.TrimEnd('/')
+            : !string.IsNullOrWhiteSpace(result.Gist.OwnerLogin)
+                ? $"https://gist.github.com/{Uri.EscapeDataString(result.Gist.OwnerLogin)}/{Uri.EscapeDataString(result.Gist.Id)}"
+                : $"https://gist.github.com/{Uri.EscapeDataString(result.Gist.Id)}";
+        var anchor = Uri.EscapeDataString($"file-{path.ToLowerInvariant().Replace(".", "-", StringComparison.Ordinal).Replace(" ", "-", StringComparison.Ordinal)}");
+        return AppendGistLineAnchor($"{baseUrl}#{anchor}", lineNumber);
+    }
+
+    return result.Repository is not null
+        ? CreateRepositoryFileUrl(result.Repository, path, lineNumber)
+        : AppendLineAnchor(result.HtmlUrl ?? string.Empty, lineNumber);
 }
 
 static bool HasMeaningfulSensitiveItemReason(string? reason)
@@ -612,22 +685,50 @@ static void WriteColoredLine(string value, ConsoleColor color, TextWriter? outpu
     outputWriter?.WriteLine(value);
 }
 
-static async Task<string> ResolveResultUrlAsync(GithubClient client, GithubCodeSearchResult result, IReadOnlyList<string> highlightTerms, ConsoleStatusLine statusLine)
+static string FormatSearchSource(GithubSearchSource source)
+{
+    return source switch
+    {
+        GithubSearchSource.Gists => "Gist",
+        _ => "Repository"
+    };
+}
+
+static async Task<string> ResolveResultUrlAsync(GithubClient client, GithubSearchResult result, IReadOnlyList<string> highlightTerms, ConsoleStatusLine statusLine)
 {
     if (string.IsNullOrWhiteSpace(result.HtmlUrl))
     {
         return string.Empty;
     }
 
-    var lineNumber = await TryResolveRepositoryFileLineNumberAsync(
-        client,
-        result.Repository.FullName,
-        result.Path,
-        GetLineSearchTerms(result, highlightTerms),
-        statusLine,
-        "Resolving match");
+    int? lineNumber;
 
-    return AppendLineAnchor(result.HtmlUrl, lineNumber);
+    if (result.Source == GithubSearchSource.Gists && result.Gist is not null)
+    {
+        statusLine.Show($"Resolving match line number for {result.Gist.DisplayName}/{FormatPathForStatus(result.Path)}...");
+        lineNumber = await client.TryFindGistFileLineNumberAsync(
+            result.Gist.Id,
+            result.Path,
+            GetLineSearchTerms(result, highlightTerms));
+    }
+    else if (result.Repository is not null)
+    {
+        lineNumber = await TryResolveRepositoryFileLineNumberAsync(
+            client,
+            result.Repository.FullName,
+            result.Path,
+            GetLineSearchTerms(result, highlightTerms),
+            statusLine,
+            "Resolving match");
+    }
+    else
+    {
+        lineNumber = null;
+    }
+
+    return result.Source == GithubSearchSource.Gists
+        ? AppendGistLineAnchor(result.HtmlUrl, lineNumber)
+        : AppendLineAnchor(result.HtmlUrl, lineNumber);
 }
 
 static async Task<int?> TryResolveRepositoryFileLineNumberAsync(
@@ -642,7 +743,7 @@ static async Task<int?> TryResolveRepositoryFileLineNumberAsync(
     return await client.TryFindRepositoryFileLineNumberAsync(repositoryFullName, path, searchTerms);
 }
 
-static IEnumerable<string> GetLineSearchTerms(GithubCodeSearchResult result, IReadOnlyList<string> highlightTerms)
+static IEnumerable<string> GetLineSearchTerms(GithubSearchResult result, IReadOnlyList<string> highlightTerms)
 {
     var matchTexts = result.TextMatches?
         .SelectMany(match => match.Matches ?? [])
@@ -704,6 +805,18 @@ static string AppendLineAnchor(string url, int? lineNumber)
     var hashIndex = url.IndexOf('#', StringComparison.Ordinal);
     var baseUrl = hashIndex >= 0 ? url[..hashIndex] : url;
     return lineNumber is > 0 ? $"{baseUrl}#L{lineNumber.Value}" : baseUrl;
+}
+
+static string AppendGistLineAnchor(string url, int? lineNumber)
+{
+    if (lineNumber is not > 0)
+    {
+        return url;
+    }
+
+    return url.Contains('#', StringComparison.Ordinal)
+        ? $"{url}-L{lineNumber.Value}"
+        : $"{url}#L{lineNumber.Value}";
 }
 
 static string FormatPathForStatus(string path)
@@ -1076,4 +1189,5 @@ internal sealed record AiValidationOutcome(AiValidationResult? Validation, strin
 
 internal sealed record AiValidationPageOutcomes(AiValidationOutcome?[] Outcomes, int ValidatedResultIndex);
 
-internal sealed record PendingAiValidationResult(int Index, GithubCodeSearchResult Result, string CacheKey);
+internal sealed record PendingAiValidationResult(int Index, GithubSearchResult Result, string CacheKey);
+

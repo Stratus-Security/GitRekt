@@ -6,6 +6,69 @@ namespace GitRekt;
 
 internal static class GitRektCli
 {
+    private static readonly HashSet<string> KnownOptionTokens = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "--token",
+        "-t",
+        "--github-access-token",
+        "--github-app-id",
+        "--app-id",
+        "--github-app-installation-id",
+        "--installation-id",
+        "--github-app-private-key-path",
+        "--private-key-path",
+        "--github-app-private-key",
+        "--private-key",
+        "--output",
+        "-o",
+        "--sources",
+        "--query",
+        "-q",
+        "--advanced",
+        "--raw-query",
+        "--ai",
+        "--ai-agent",
+        "--ai-provider",
+        "--ai-model",
+        "--ai-api-key",
+        "--gemini-api-key",
+        "--openai-api-key",
+        "--ai-verdict",
+        "--ai-category",
+        "--ai-show",
+        "--strict",
+        "--help",
+        "-h",
+        "/?",
+        "-?"
+    };
+
+    private static readonly HashSet<string> OptionsWithSingleValue = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "--token",
+        "-t",
+        "--github-access-token",
+        "--github-app-id",
+        "--app-id",
+        "--github-app-installation-id",
+        "--installation-id",
+        "--github-app-private-key-path",
+        "--private-key-path",
+        "--github-app-private-key",
+        "--private-key",
+        "--output",
+        "-o",
+        "--sources",
+        "--ai-provider",
+        "--ai-model",
+        "--ai-api-key",
+        "--gemini-api-key",
+        "--openai-api-key",
+        "--ai-verdict",
+        "--ai-category",
+        "--ai-show"
+    };
+
     public static async Task<(int ExitCode, GitRektCliArguments? Arguments)> ParseAsync(string[] args)
     {
         GitRektCliArguments? parsedArguments = null;
@@ -29,7 +92,9 @@ internal static class GitRektCli
         var outputOption = new Option<string?>("--output", "Write output to a file.");
         outputOption.AddAlias("-o");
 
-        var queryOption = new Option<string[]>("--query", "Run one or more GitHub code search queries in a single execution.")
+        var sourcesOption = new Option<string?>("--sources", "Comma-separated search sources in execution order. Supported: gists, repos. Defaults to gists,repos.");
+
+        var queryOption = new Option<string[]>("--query", "Run one or more GitHub search queries in a single execution.")
         {
             Arity = ArgumentArity.ZeroOrMore
         };
@@ -60,10 +125,12 @@ internal static class GitRektCli
         var strictOption = new Option<bool>("--strict", "Use stricter AI validation. Ordinary business contact lists are treated as low signal unless stronger sensitive data is present.");
 
         var rootCommand = new RootCommand("""
-Search GitHub code.
+Search GitHub gists and code.
 
 Examples:
   GitRekt --query "Password1"
+  GitRekt --query "Password1" --sources repos,gists
+  GitRekt --query "Password1" --sources gists
   GitRekt --query "@example.com"
   GitRekt -o results.txt --query "Password1"
   GitRekt --query "Password1" --query "Password2"
@@ -83,6 +150,7 @@ Examples:
         rootCommand.AddOption(githubAppPrivateKeyPathOption);
         rootCommand.AddOption(githubAppPrivateKeyOption);
         rootCommand.AddOption(outputOption);
+        rootCommand.AddOption(sourcesOption);
         rootCommand.AddOption(queryOption);
         rootCommand.AddOption(advancedQueryOption);
         rootCommand.AddOption(validateAiOption);
@@ -100,10 +168,18 @@ Examples:
             }
 
             var queries = parseResult.GetValueForOption(queryOption) ?? [];
+            var sources = parseResult.GetValueForOption(sourcesOption);
+            var hasSources = parseResult.FindResultFor(sourcesOption) is not null;
 
             if (queries.Length == 0)
             {
                 parseResult.ErrorMessage = "At least one --query value is required.";
+                return;
+            }
+
+            if (!TryParseSearchSources(sources, defaultWhenMissing: !hasSources, out _, out var sourcesError))
+            {
+                parseResult.ErrorMessage = sourcesError;
                 return;
             }
 
@@ -181,6 +257,8 @@ Examples:
             var githubAppPrivateKeyPath = parseResult.GetValueForOption(githubAppPrivateKeyPathOption) ?? Environment.GetEnvironmentVariable("GITHUB_APP_PRIVATE_KEY_PATH");
             var githubAppPrivateKey = parseResult.GetValueForOption(githubAppPrivateKeyOption) ?? Environment.GetEnvironmentVariable("GITHUB_APP_PRIVATE_KEY");
             var outputPath = parseResult.GetValueForOption(outputOption);
+            var searchSourcesValue = parseResult.GetValueForOption(sourcesOption);
+            var hasSearchSources = parseResult.FindResultFor(sourcesOption) is not null;
             var useAdvancedQuery = parseResult.GetValueForOption(advancedQueryOption);
             var validateAi = parseResult.GetValueForOption(validateAiOption);
             var useAiAgent = parseResult.GetValueForOption(aiAgentOption);
@@ -201,6 +279,11 @@ Examples:
             if (queries.Length == 0)
             {
                 throw new InvalidOperationException("At least one --query value is required.");
+            }
+
+            if (!TryParseSearchSources(searchSourcesValue, defaultWhenMissing: !hasSearchSources, out var searchSources, out var searchSourcesError))
+            {
+                throw new InvalidOperationException(searchSourcesError);
             }
 
             if (shouldValidateAi && string.IsNullOrWhiteSpace(aiModel))
@@ -257,6 +340,7 @@ Examples:
                 accessToken,
                 githubAppAuthentication,
                 outputPath,
+                searchSources,
                 useAdvancedQuery,
                 shouldValidateAi
                     ? new AiValidationConfiguration(
@@ -279,6 +363,12 @@ Examples:
             middlewarePipeline: null,
             helpBuilderFactory: null,
             tokenReplacer: null));
+
+        if (TryGetUnknownOption(args, out var unknownOption))
+        {
+            Console.Error.WriteLine($"Unknown option '{unknownOption}'. Use --help to see supported options.");
+            return (1, null);
+        }
 
         if (IsHelpRequested(args))
         {
@@ -308,6 +398,75 @@ Examples:
         return TryParseAiValidationVerdict(value, out var verdict)
             ? verdict
             : throw new InvalidOperationException($"Unsupported --ai-verdict value '{value}'. Supported values: likely, possible, none.");
+    }
+
+    private static bool TryParseSearchSources(string? value, bool defaultWhenMissing, out IReadOnlyList<GithubSearchSource> sources, out string error)
+    {
+        if (string.IsNullOrWhiteSpace(value) && !defaultWhenMissing)
+        {
+            sources = [];
+            error = "Unsupported --sources value. Use a comma-separated list containing gists and/or repos.";
+            return false;
+        }
+
+        var sourceValue = string.IsNullOrWhiteSpace(value) ? "gists,repos" : value;
+        var parsedSources = new List<GithubSearchSource>();
+        var seenSources = new HashSet<GithubSearchSource>();
+
+        foreach (var token in sourceValue.Split(',', StringSplitOptions.TrimEntries))
+        {
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                sources = [];
+                error = "Unsupported --sources value. Use a comma-separated list containing gists and/or repos.";
+                return false;
+            }
+
+            if (!TryParseSearchSource(token, out var source))
+            {
+                sources = [];
+                error = $"Unsupported --sources value '{token}'. Supported values: gists, repos.";
+                return false;
+            }
+
+            if (seenSources.Add(source))
+            {
+                parsedSources.Add(source);
+            }
+        }
+
+        if (parsedSources.Count == 0)
+        {
+            sources = [];
+            error = "Unsupported --sources value. Use a comma-separated list containing gists and/or repos.";
+            return false;
+        }
+
+        sources = parsedSources;
+        error = string.Empty;
+        return true;
+    }
+
+    private static bool TryParseSearchSource(string value, out GithubSearchSource source)
+    {
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "gist":
+            case "gists":
+                source = GithubSearchSource.Gists;
+                return true;
+
+            case "repo":
+            case "repos":
+            case "repository":
+            case "repositories":
+                source = GithubSearchSource.Repositories;
+                return true;
+
+            default:
+                source = default;
+                return false;
+        }
     }
 
     private static bool TryParseAiValidationVerdict(string? value, out AiValidationVerdict verdict)
@@ -356,6 +515,56 @@ Examples:
             || string.Equals(arg, "-h", StringComparison.OrdinalIgnoreCase)
             || string.Equals(arg, "/?", StringComparison.OrdinalIgnoreCase)
             || string.Equals(arg, "-?", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool TryGetUnknownOption(IEnumerable<string> args, out string unknownOption)
+    {
+        var skipNextValue = false;
+
+        foreach (var arg in args)
+        {
+            if (skipNextValue)
+            {
+                skipNextValue = false;
+                continue;
+            }
+
+            var optionName = GetOptionName(arg);
+
+            if (!LooksLikeOption(optionName))
+            {
+                continue;
+            }
+
+            if (!KnownOptionTokens.Contains(optionName))
+            {
+                unknownOption = optionName;
+                return true;
+            }
+
+            skipNextValue = OptionsWithSingleValue.Contains(optionName) && !arg.Contains('=', StringComparison.Ordinal);
+        }
+
+        unknownOption = string.Empty;
+        return false;
+    }
+
+    private static bool LooksLikeOption(string arg)
+    {
+        return arg.StartsWith("-", StringComparison.Ordinal)
+            || string.Equals(arg, "/?", StringComparison.Ordinal)
+            || arg.StartsWith("--", StringComparison.Ordinal);
+    }
+
+    private static string GetOptionName(string arg)
+    {
+        if (!arg.StartsWith("--", StringComparison.Ordinal))
+        {
+            return arg;
+        }
+
+        var equalsIndex = arg.IndexOf('=', StringComparison.Ordinal);
+        return equalsIndex > 0 ? arg[..equalsIndex] : arg;
     }
 
     private static string? ResolveGithubAppPrivateKeyPath(string? githubAppId, string? explicitPrivateKeyPath, string? privateKey)
@@ -429,19 +638,20 @@ Examples:
     {
         Console.WriteLine("""
 Description:
-  Search GitHub code.
+  Search GitHub gists and code.
 
 Usage:
   GitRekt --query <query> [options]
 
 Options:
-  -q, --query <query>                         Run one or more GitHub code search queries.
+  -q, --query <query>                         Run one or more GitHub search queries.
   -t, --token <token>                         GitHub access token. Defaults to GITHUB_ACCESS_TOKEN.
   --github-app-id, --app-id <id>              GitHub App ID. Defaults to GITHUB_APP_ID.
   --github-app-installation-id <id>           GitHub App installation ID. Defaults to GITHUB_APP_INSTALLATION_ID.
   --github-app-private-key-path <path>        Path to a GitHub App private key PEM. Defaults to GITHUB_APP_PRIVATE_KEY_PATH, or exactly one *.private-key.pem file in the current directory.
   --github-app-private-key <pem>              GitHub App private key PEM content. Defaults to GITHUB_APP_PRIVATE_KEY.
   -o, --output <path>                         Write output to a file.
+  --sources <sources>                         Comma-separated sources in order. Supported: gists, repos. Defaults to gists,repos.
   --advanced, --raw-query                     Pass each query to GitHub code search unchanged.
   --ai                                        Validate each displayed result with AI.
   --ai-agent                                  Gather same-repository evidence before AI validation.
@@ -455,6 +665,8 @@ Options:
 
 Examples:
   GitRekt --query "Password1"
+  GitRekt --query "Password1" --sources repos,gists
+  GitRekt --query "Password1" --sources gists
   GitRekt --query "Password1" --ai-provider gemini --ai-model gemini-2.5-flash
   GitRekt --query "Password1" --ai-provider openai --ai-model gpt-5-mini
   GitRekt --github-app-id 12345 --query "Password1"
@@ -468,6 +680,7 @@ internal sealed record GitRektCliArguments(
     string? Token,
     GithubAppAuthenticationConfiguration? GithubAppAuthentication,
     string? OutputPath,
+    IReadOnlyList<GithubSearchSource> SearchSources,
     bool UseAdvancedQuery,
     AiValidationConfiguration? AiValidation,
     AiValidationVerdict? AiValidationVerdictFilter);

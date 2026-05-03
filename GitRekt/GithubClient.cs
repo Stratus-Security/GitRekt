@@ -1,9 +1,10 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
+using System.Text.RegularExpressions;
 
 namespace GitRekt;
 
@@ -11,6 +12,10 @@ internal sealed class GithubClient : IDisposable
 {
     private const int MaxPageSize = 100;
     private const int MaxSearchResults = 1000;
+    private const int GistSearchPageSize = 10;
+    private const int MaxGistSearchResults = 1000;
+    private const int MaxGistSnippetLength = 500;
+    private const long MaxGistRawFileSizeBytes = 10 * 1024 * 1024;
     private static readonly TimeSpan MaxAutomaticRateLimitDelay = TimeSpan.FromMinutes(1);
     private const int MaxAutomaticRateLimitRetries = 3;
     private static readonly TimeSpan SecondaryRateLimitDelay = TimeSpan.FromSeconds(15);
@@ -24,9 +29,11 @@ internal sealed class GithubClient : IDisposable
     private readonly Action? _clearStatusMessage;
     private readonly Dictionary<string, GithubRateLimitState> _rateLimitStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _fileContentCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _gistFileContentCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, GithubRepositoryTreeResponse> _repositoryTreeCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _rateLimitLock = new();
     private readonly object _fileContentCacheLock = new();
+    private readonly object _gistFileContentCacheLock = new();
     private readonly object _repositoryTreeCacheLock = new();
 
     public GithubClient(
@@ -66,9 +73,9 @@ internal sealed class GithubClient : IDisposable
         _hasAuthentication = !string.IsNullOrWhiteSpace(accessToken) || accessTokenProvider is not null;
     }
 
-    public async Task<GithubCodeSearchResults> SearchCodeAsync(string query, bool useAdvancedQuery = false, CancellationToken cancellationToken = default)
+    public async Task<GithubSearchResults> SearchCodeAsync(string query, bool useAdvancedQuery = false, CancellationToken cancellationToken = default)
     {
-        var allResults = new List<GithubCodeSearchResult>();
+        var allResults = new List<GithubSearchResult>();
         var totalCount = 0;
         var incompleteResults = false;
 
@@ -81,7 +88,7 @@ internal sealed class GithubClient : IDisposable
 
         var cappedTotalCount = Math.Min(totalCount, MaxSearchResults);
 
-        return new GithubCodeSearchResults(allResults, totalCount, cappedTotalCount, incompleteResults);
+        return new GithubSearchResults(allResults, totalCount, cappedTotalCount, incompleteResults);
     }
 
     public async IAsyncEnumerable<GithubCodeSearchPage> SearchCodePagesAsync(
@@ -130,7 +137,7 @@ internal sealed class GithubClient : IDisposable
         }
     }
 
-    public async Task<IReadOnlyList<GithubCodeSearchResult>> SearchRepositoryCodeAsync(string repositoryFullName, string query, int limit, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<GithubSearchResult>> SearchRepositoryCodeAsync(string repositoryFullName, string query, int limit, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(repositoryFullName);
         ArgumentException.ThrowIfNullOrWhiteSpace(query);
@@ -249,7 +256,208 @@ internal sealed class GithubClient : IDisposable
         return null;
     }
 
-    private static int CountLinesBeforeIndex(string content, int index)
+    public async IAsyncEnumerable<GithubCodeSearchPage> SearchGistPagesAsync(
+        string query,
+        bool useAdvancedQuery = false,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(query);
+
+        var searchTerms = ExtractGistSearchTerms(query, useAdvancedQuery);
+        var processedGists = 0;
+        var totalCount = 0;
+        var availableCount = MaxGistSearchResults;
+        var seenGistIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        for (var page = 1; processedGists < availableCount; page++)
+        {
+            _showStatusMessage?.Invoke($"Searching GitHub gists page {page}...");
+            var gistSearchPage = await GetGistSearchPageAsync(query, page, cancellationToken);
+
+            if (page == 1)
+            {
+                totalCount = gistSearchPage.TotalCount;
+                availableCount = Math.Min(totalCount, MaxGistSearchResults);
+            }
+
+            if (gistSearchPage.GistIds.Count == 0 || totalCount == 0)
+            {
+                break;
+            }
+
+            var pageResults = new List<GithubSearchResult>();
+
+            foreach (var gistId in gistSearchPage.GistIds)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (processedGists >= availableCount)
+                {
+                    break;
+                }
+
+                if (!seenGistIds.Add(gistId))
+                {
+                    continue;
+                }
+
+                processedGists++;
+                var gist = await GetGistAsync(gistId, cancellationToken);
+
+                foreach (var result in await SearchGistAsync(gist, searchTerms, cancellationToken))
+                {
+                    pageResults.Add(result);
+                }
+            }
+
+            yield return new GithubCodeSearchPage(page, pageResults, totalCount, availableCount, false);
+
+            if (processedGists >= availableCount || gistSearchPage.GistIds.Count < GistSearchPageSize)
+            {
+                break;
+            }
+        }
+    }
+
+    public async Task<string> GetGistFileContentAsync(string gistId, string filename, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(gistId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(filename);
+
+        var cacheKey = $"{gistId}\n{filename}";
+
+        lock (_gistFileContentCacheLock)
+        {
+            if (_gistFileContentCache.TryGetValue(cacheKey, out var cachedContent))
+            {
+                return cachedContent;
+            }
+        }
+
+        var gist = await GetGistAsync(gistId, cancellationToken);
+
+        if (!gist.Files.TryGetValue(filename, out var file))
+        {
+            throw new InvalidOperationException($"Gist file '{filename}' was not found.");
+        }
+
+        var content = await GetGistFileContentAsync(gistId, filename, file, cancellationToken);
+
+        if (content is null)
+        {
+            throw new InvalidOperationException($"Gist file '{filename}' did not include readable content.");
+        }
+
+        return content;
+    }
+
+    public async Task<int?> TryFindGistFileLineNumberAsync(string gistId, string filename, IEnumerable<string> searchTerms, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var content = await GetGistFileContentAsync(gistId, filename, cancellationToken);
+
+            foreach (var searchTerm in searchTerms.Where(term => !string.IsNullOrWhiteSpace(term)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                var index = content.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase);
+
+                if (index >= 0)
+                {
+                    return CountLinesBeforeIndex(content, index) + 1;
+                }
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    public async Task<IReadOnlyList<GithubGistFileContent>> GetGistFilesAsync(string gistId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(gistId);
+
+        var gist = await GetGistAsync(gistId, cancellationToken);
+        var files = new List<GithubGistFileContent>();
+
+        foreach (var (fileKey, file) in gist.Files)
+        {
+            var filename = !string.IsNullOrWhiteSpace(file.Filename) ? file.Filename : fileKey;
+
+            if (string.IsNullOrWhiteSpace(filename))
+            {
+                continue;
+            }
+
+            var content = await GetGistFileContentAsync(gistId, filename, file, cancellationToken);
+
+            if (content is not null)
+            {
+                files.Add(new GithubGistFileContent(filename, file.Size, content));
+            }
+        }
+
+        return files;
+    }
+
+    internal static IReadOnlyList<string> ExtractGistSearchTerms(string query, bool useAdvancedQuery)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        if (!useAdvancedQuery)
+        {
+            return query
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        var terms = new List<string>();
+        var current = new StringBuilder();
+        var inQuotes = false;
+
+        foreach (var character in query)
+        {
+            if (character == '"')
+            {
+                if (inQuotes && current.Length > 0)
+                {
+                    terms.Add(current.ToString());
+                    current.Clear();
+                }
+
+                inQuotes = !inQuotes;
+                continue;
+            }
+
+            if (inQuotes)
+            {
+                current.Append(character);
+            }
+        }
+
+        foreach (var token in query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (token.Contains(':', StringComparison.Ordinal) || token.Contains('"', StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            terms.Add(token);
+        }
+
+        return terms
+            .Where(term => !string.IsNullOrWhiteSpace(term))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    internal static int CountLinesBeforeIndex(string content, int index)
     {
         var lineCount = 0;
 
@@ -310,22 +518,296 @@ internal sealed class GithubClient : IDisposable
             cancellationToken) ?? new GithubCodeSearchResponse();
     }
 
+    private async Task<GithubGistSearchPage> GetGistSearchPageAsync(string query, int page, CancellationToken cancellationToken)
+    {
+        var requestUri = $"https://gist.github.com/search?q={Uri.EscapeDataString(query)}&p={page}";
+        var html = await GetStringAsync(
+            requestUri,
+            "core",
+            "GitHub gist search failed",
+            cancellationToken,
+            allowAnonymousRetry: true,
+            useAuthentication: false);
+
+        return ParseGistSearchPage(html);
+    }
+
+    private async Task<GithubGistResponse> GetGistAsync(string gistId, CancellationToken cancellationToken)
+    {
+        var requestUri = $"gists/{Uri.EscapeDataString(gistId)}";
+        return await GetJsonAsync(
+            requestUri,
+            "core",
+            "GitHub gist fetch failed",
+            GithubJsonSerializerContext.Default.GithubGistResponse,
+            cancellationToken,
+            allowAnonymousRetry: true);
+    }
+
+    private async Task<IReadOnlyList<GithubSearchResult>> SearchGistAsync(GithubGistResponse gist, IReadOnlyList<string> searchTerms, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(gist.Id) || gist.Files.Count == 0)
+        {
+            return [];
+        }
+
+        var results = new List<GithubSearchResult>();
+
+        foreach (var (fileKey, file) in gist.Files)
+        {
+            var filename = !string.IsNullOrWhiteSpace(file.Filename) ? file.Filename : fileKey;
+
+            if (string.IsNullOrWhiteSpace(filename))
+            {
+                continue;
+            }
+
+            var content = await GetGistFileContentAsync(gist.Id, filename, file, cancellationToken);
+
+            if (content is null)
+            {
+                continue;
+            }
+
+            var matches = CreateGistTextMatches(content, searchTerms);
+
+            if (matches.Count == 0)
+            {
+                continue;
+            }
+
+            var ownerLogin = gist.Owner?.Login;
+            var htmlUrl = CreateGistFileUrl(gist.HtmlUrl, ownerLogin, gist.Id, filename);
+            results.Add(new GithubSearchResult(
+                filename,
+                filename,
+                htmlUrl,
+                null,
+                matches,
+                GithubSearchSource.Gists,
+                new GithubGistSearchMetadata(gist.Id, ownerLogin, gist.HtmlUrl, gist.Description)));
+        }
+
+        return results;
+    }
+
+    private async Task<string?> GetGistFileContentAsync(string gistId, string filename, GithubGistFile file, CancellationToken cancellationToken)
+    {
+        var cacheKey = $"{gistId}\n{filename}";
+
+        lock (_gistFileContentCacheLock)
+        {
+            if (_gistFileContentCache.TryGetValue(cacheKey, out var cachedContent))
+            {
+                return cachedContent;
+            }
+        }
+
+        string? content = null;
+
+        if (!string.IsNullOrEmpty(file.Content) && file.Truncated != true)
+        {
+            content = file.Content;
+        }
+        else if (file.Size is null or <= MaxGistRawFileSizeBytes && !string.IsNullOrWhiteSpace(file.RawUrl))
+        {
+            content = await GetRawStringAsync(file.RawUrl, cancellationToken);
+        }
+
+        if (content is not null)
+        {
+            lock (_gistFileContentCacheLock)
+            {
+                _gistFileContentCache.TryAdd(cacheKey, content);
+            }
+        }
+
+        return content;
+    }
+
+    private async Task<string?> GetRawStringAsync(string requestUri, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var response = await SendGetAsync(requestUri, "core", cancellationToken, allowAnonymousRetry: true);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            if (response.Content.Headers.ContentLength is > MaxGistRawFileSizeBytes)
+            {
+                return null;
+            }
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+
+            if (bytes.LongLength > MaxGistRawFileSizeBytes)
+            {
+                return null;
+            }
+
+            return Encoding.UTF8.GetString(bytes);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static IReadOnlyList<GithubTextMatch> CreateGistTextMatches(string content, IReadOnlyList<string> searchTerms)
+    {
+        var matches = new List<GithubTextMatch>();
+
+        if (searchTerms.Count == 0)
+        {
+            var fragment = content
+                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault();
+
+            if (string.IsNullOrWhiteSpace(fragment))
+            {
+                return [];
+            }
+
+            if (fragment.Length > MaxGistSnippetLength)
+            {
+                fragment = fragment[..MaxGistSnippetLength];
+            }
+
+            return [new GithubTextMatch("FileContent", "content", fragment, null)];
+        }
+
+        foreach (var term in searchTerms)
+        {
+            var index = content.IndexOf(term, StringComparison.OrdinalIgnoreCase);
+
+            if (index < 0)
+            {
+                continue;
+            }
+
+            var lineStart = content.LastIndexOf('\n', Math.Max(0, index - 1));
+            lineStart = lineStart < 0 ? 0 : lineStart + 1;
+            var lineEnd = content.IndexOf('\n', index);
+            lineEnd = lineEnd < 0 ? content.Length : lineEnd;
+            var fragment = content[lineStart..lineEnd].TrimEnd('\r');
+
+            if (fragment.Length > MaxGistSnippetLength)
+            {
+                var relativeIndex = Math.Max(0, index - lineStart);
+                var snippetStart = Math.Clamp(relativeIndex - (MaxGistSnippetLength / 2), 0, Math.Max(0, fragment.Length - MaxGistSnippetLength));
+                fragment = fragment[snippetStart..Math.Min(fragment.Length, snippetStart + MaxGistSnippetLength)];
+            }
+
+            var fragmentIndex = fragment.IndexOf(term, StringComparison.OrdinalIgnoreCase);
+            IReadOnlyList<GithubTextMatchOccurrence>? occurrences = fragmentIndex >= 0
+                ? [new GithubTextMatchOccurrence(fragment.Substring(fragmentIndex, term.Length), [fragmentIndex, fragmentIndex + term.Length])]
+                : null;
+            matches.Add(new GithubTextMatch("FileContent", "content", fragment, occurrences));
+        }
+
+        return matches
+            .DistinctBy(match => match.Fragment, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private static string CreateGistFileUrl(string? gistHtmlUrl, string? ownerLogin, string gistId, string filename)
+    {
+        var baseUrl = !string.IsNullOrWhiteSpace(gistHtmlUrl)
+            ? gistHtmlUrl.TrimEnd('/')
+            : !string.IsNullOrWhiteSpace(ownerLogin)
+                ? $"https://gist.github.com/{Uri.EscapeDataString(ownerLogin)}/{Uri.EscapeDataString(gistId)}"
+                : $"https://gist.github.com/{Uri.EscapeDataString(gistId)}";
+        var anchor = Uri.EscapeDataString($"file-{filename.ToLowerInvariant().Replace(".", "-", StringComparison.Ordinal).Replace(" ", "-", StringComparison.Ordinal)}");
+        return $"{baseUrl}#{anchor}";
+    }
+
+    private static GithubGistSearchPage ParseGistSearchPage(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return new GithubGistSearchPage(0, []);
+        }
+
+        var totalCount = 0;
+        var countMatch = Regex.Match(
+            WebUtility.HtmlDecode(html),
+            @"(?<count>\d[\d,]*)\s+gist\s+results",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        if (countMatch.Success)
+        {
+            _ = int.TryParse(
+                countMatch.Groups["count"].Value.Replace(",", string.Empty, StringComparison.Ordinal),
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out totalCount);
+        }
+
+        var gistIds = new List<string>();
+        var seenGistIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (Match match in Regex.Matches(
+            html,
+            @"href\s*=\s*[""']/(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?/)?(?<id>[0-9a-f]{20,40})(?:[/?#][^""']*)?[""']",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+        {
+            var gistId = match.Groups["id"].Value;
+
+            if (seenGistIds.Add(gistId))
+            {
+                gistIds.Add(gistId);
+            }
+        }
+
+        if (totalCount == 0 && gistIds.Count > 0)
+        {
+            totalCount = MaxGistSearchResults;
+        }
+
+        return new GithubGistSearchPage(totalCount, gistIds);
+    }
+
+    private async Task<string> GetStringAsync(
+        string requestUri,
+        string rateLimitResource,
+        string failurePrefix,
+        CancellationToken cancellationToken,
+        bool allowAnonymousRetry = false,
+        bool useAuthentication = true)
+    {
+        using var response = await SendGetAsync(requestUri, rateLimitResource, cancellationToken, allowAnonymousRetry, useAuthentication);
+
+        if (response.IsSuccessStatusCode)
+        {
+            return await response.Content.ReadAsStringAsync(cancellationToken);
+        }
+
+        if (TryGetRateLimitDelay(response, null, rateLimitResource, out var retryDelay, out var rateLimitMessage, out var rateLimitDetails))
+        {
+            _clearStatusMessage?.Invoke();
+            throw CreateRateLimitException(response.StatusCode, retryDelay, rateLimitMessage, rateLimitDetails);
+        }
+
+        _clearStatusMessage?.Invoke();
+        throw new HttpRequestException($"{failurePrefix}: {response.StatusCode}", null, response.StatusCode);
+    }
+
     private async Task<T> GetJsonAsync<T>(
         string requestUri,
         string rateLimitResource,
         string failurePrefix,
         JsonTypeInfo<T> jsonTypeInfo,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowAnonymousRetry = false)
     {
         var refreshedAfterBadCredentials = false;
 
         for (var attempt = 0; ; attempt++)
         {
-            await WaitForKnownRateLimitAsync(rateLimitResource, cancellationToken);
-            await EnsureFreshAccessTokenAsync(forceRefresh: false, cancellationToken);
-
-            using var response = await _httpClient.GetAsync(requestUri, cancellationToken);
-            UpdateRateLimitState(response, rateLimitResource);
+            using var response = await SendGetAsync(requestUri, rateLimitResource, cancellationToken, allowAnonymousRetry);
             await using var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken);
 
             if (response.IsSuccessStatusCode)
@@ -360,6 +842,68 @@ internal sealed class GithubClient : IDisposable
             _clearStatusMessage?.Invoke();
             var errorMessage = FormatGithubFailureMessage(failurePrefix, response.StatusCode, errorResponse?.Message ?? response.ReasonPhrase);
             throw new HttpRequestException(errorMessage, null, response.StatusCode);
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendGetAsync(
+        string requestUri,
+        string rateLimitResource,
+        CancellationToken cancellationToken,
+        bool allowAnonymousRetry,
+        bool useAuthentication = true)
+    {
+        await WaitForKnownRateLimitAsync(rateLimitResource, cancellationToken);
+
+        if (useAuthentication)
+        {
+            await EnsureFreshAccessTokenAsync(forceRefresh: false, cancellationToken);
+        }
+
+        var authorization = _httpClient.DefaultRequestHeaders.Authorization;
+
+        if (!useAuthentication)
+        {
+            _httpClient.DefaultRequestHeaders.Authorization = null;
+        }
+
+        HttpResponseMessage response;
+
+        try
+        {
+            response = await _httpClient.GetAsync(requestUri, cancellationToken);
+        }
+        finally
+        {
+            if (!useAuthentication)
+            {
+                _httpClient.DefaultRequestHeaders.Authorization = authorization;
+            }
+        }
+
+        UpdateRateLimitState(response, rateLimitResource);
+
+        if (!allowAnonymousRetry || response.IsSuccessStatusCode || authorization is null || !useAuthentication)
+        {
+            return response;
+        }
+
+        if (response.StatusCode is not HttpStatusCode.Unauthorized and not HttpStatusCode.Forbidden)
+        {
+            return response;
+        }
+
+        response.Dispose();
+
+        try
+        {
+            _httpClient.DefaultRequestHeaders.Authorization = null;
+            var anonymousResponse = await _httpClient.GetAsync(requestUri, cancellationToken);
+            UpdateRateLimitState(anonymousResponse, rateLimitResource);
+            return anonymousResponse;
+        }
+        finally
+        {
+            _httpClient.DefaultRequestHeaders.Authorization = authorization;
         }
     }
 
@@ -681,21 +1225,23 @@ internal sealed class GithubCodeSearchResponse
     public bool IncompleteResults { get; init; }
 
     [JsonPropertyName("items")]
-    public List<GithubCodeSearchResult> Items { get; init; } = [];
+    public List<GithubSearchResult> Items { get; init; } = [];
 }
 
-internal sealed record GithubCodeSearchResults(
-    IReadOnlyList<GithubCodeSearchResult> Items,
+internal sealed record GithubSearchResults(
+    IReadOnlyList<GithubSearchResult> Items,
     int TotalCount,
     int AvailableCount,
     bool IncompleteResults);
 
 internal sealed record GithubCodeSearchPage(
     int Page,
-    IReadOnlyList<GithubCodeSearchResult> Items,
+    IReadOnlyList<GithubSearchResult> Items,
     int TotalCount,
     int AvailableCount,
     bool IncompleteResults);
+
+internal sealed record GithubGistSearchPage(int TotalCount, IReadOnlyList<string> GistIds);
 
 internal sealed class GithubErrorResponse
 {
@@ -741,7 +1287,13 @@ internal sealed record GithubRateLimitState(int? Remaining, DateTimeOffset? Rese
 
 internal sealed record GithubRateLimitDetails(string Resource, int? Remaining, int? Limit);
 
-internal sealed record GithubCodeSearchResult(
+internal enum GithubSearchSource
+{
+    Gists,
+    Repositories
+}
+
+internal sealed record GithubSearchResult(
     [property: JsonPropertyName("name")]
     string Name,
 
@@ -752,10 +1304,21 @@ internal sealed record GithubCodeSearchResult(
     string? HtmlUrl,
 
     [property: JsonPropertyName("repository")]
-    GithubCodeSearchRepository Repository,
+    GithubCodeSearchRepository? Repository,
 
     [property: JsonPropertyName("text_matches")]
-    IReadOnlyList<GithubTextMatch>? TextMatches);
+    IReadOnlyList<GithubTextMatch>? TextMatches,
+
+    GithubSearchSource Source = GithubSearchSource.Repositories,
+
+    GithubGistSearchMetadata? Gist = null)
+{
+    public string ContainerName => Source switch
+    {
+        GithubSearchSource.Gists => Gist?.DisplayName ?? "gist",
+        _ => Repository?.FullName ?? "repository"
+    };
+}
 
 internal sealed record GithubCodeSearchRepository(
     [property: JsonPropertyName("full_name")]
@@ -787,11 +1350,70 @@ internal sealed record GithubTextMatchOccurrence(
     [property: JsonPropertyName("indices")]
     IReadOnlyList<int>? Indices);
 
+internal sealed record GithubGistSearchMetadata(string Id, string? OwnerLogin, string? HtmlUrl, string? Description)
+{
+    public string DisplayName => !string.IsNullOrWhiteSpace(OwnerLogin)
+        ? $"{OwnerLogin}/{Id}"
+        : Id;
+}
+
+internal sealed class GithubGistResponse
+{
+    [JsonPropertyName("id")]
+    public string? Id { get; init; }
+
+    [JsonPropertyName("html_url")]
+    public string? HtmlUrl { get; init; }
+
+    [JsonPropertyName("description")]
+    public string? Description { get; init; }
+
+    [JsonPropertyName("owner")]
+    public GithubUser? Owner { get; init; }
+
+    [JsonPropertyName("files")]
+    public Dictionary<string, GithubGistFile> Files { get; init; } = [];
+
+    [JsonPropertyName("truncated")]
+    public bool? Truncated { get; init; }
+}
+
+internal sealed class GithubGistFile
+{
+    [JsonPropertyName("filename")]
+    public string? Filename { get; init; }
+
+    [JsonPropertyName("raw_url")]
+    public string? RawUrl { get; init; }
+
+    [JsonPropertyName("size")]
+    public long? Size { get; init; }
+
+    [JsonPropertyName("truncated")]
+    public bool? Truncated { get; init; }
+
+    [JsonPropertyName("content")]
+    public string? Content { get; init; }
+}
+
+internal sealed record GithubGistFileContent(string Filename, long? Size, string Content);
+
+internal sealed class GithubUser
+{
+    [JsonPropertyName("login")]
+    public string? Login { get; init; }
+}
+
 [JsonSerializable(typeof(GithubCodeSearchResponse))]
 [JsonSerializable(typeof(GithubErrorResponse))]
 [JsonSerializable(typeof(GithubContentResponse))]
 [JsonSerializable(typeof(GithubRepositoryTreeResponse))]
 [JsonSerializable(typeof(GithubRepositoryTreeEntry))]
+[JsonSerializable(typeof(GithubGistResponse))]
+[JsonSerializable(typeof(GithubGistFile))]
+[JsonSerializable(typeof(GithubUser))]
+[JsonSerializable(typeof(List<GithubGistResponse>))]
 internal sealed partial class GithubJsonSerializerContext : JsonSerializerContext
 {
 }
+

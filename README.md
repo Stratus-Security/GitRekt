@@ -21,7 +21,7 @@ Use GitRekt when you already have a signal you want to investigate across GitHub
 
 ## How It Works
 
-GitRekt runs GitHub code searches, streams matches as they are found, and prints readable results with direct GitHub links. When AI validation is enabled, each result is classified as `likely`, `possible`, or `none` so you can filter out obvious noise.
+GitRekt searches GitHub gists and repositories, streams matches as they are found, and prints readable results with direct GitHub links. By default it searches `gists,repos` in that order. Gists are discovered through GitHub's gist search results, then GitRekt fetches matching gist files for snippets, line anchors, and AI context. When AI validation is enabled, each result is classified as `likely`, `possible`, or `none` so you can filter out obvious noise.
 
 Agent mode goes further: before classifying a match, GitRekt gathers repository context such as the matched file, high-signal companion files, and suspicious paths from the repository tree. This helps catch cases where the first match is only a clue, but a nearby `.env`, config backup, CSV export, or token-bearing file is the real issue.
 
@@ -51,6 +51,18 @@ Search for multiple terms in one run:
 
 ```bash
 GitRekt --query "Password1" --query "Password2" --query "@example.com"
+```
+
+Search only repositories:
+
+```bash
+GitRekt --query "Password1" --sources repos
+```
+
+Choose ordered sources explicitly:
+
+```bash
+GitRekt --query "Password1" --sources repos,gists
 ```
 
 Write output to a file:
@@ -170,7 +182,7 @@ Strict mode treats marketing lists, public staff directories, and ordinary work 
 ### Agent Mode
 
 Agent mode gathers same-repository context before validation. It works with every AI by adding matched file excerpts and high-signal repository candidates before asking the model to classify the result.
-The agent also looks for other sensitive files within the repo, automagically finding secrets, PII, etc that may be leaked relating to a matching keyword.
+The agent also looks for other sensitive files within the repo, automagically finding secrets, PII, etc that may be leaked relating to a matching keyword. For gist results, agent mode is limited to the matched gist and other files in that same gist.
 
 > Note: This mode uses more tokens, plain AI mode simply classifies the context from GitHub search.
 
