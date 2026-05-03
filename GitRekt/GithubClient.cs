@@ -358,8 +358,8 @@ internal sealed class GithubClient : IDisposable
             }
 
             _clearStatusMessage?.Invoke();
-            var errorMessage = errorResponse?.Message ?? response.ReasonPhrase;
-            throw new HttpRequestException($"{failurePrefix}: {errorMessage}", null, response.StatusCode);
+            var errorMessage = FormatGithubFailureMessage(failurePrefix, response.StatusCode, errorResponse?.Message ?? response.ReasonPhrase);
+            throw new HttpRequestException(errorMessage, null, response.StatusCode);
         }
     }
 
@@ -582,6 +582,41 @@ internal sealed class GithubClient : IDisposable
         }
 
         return new HttpRequestException(builder.ToString(), null, statusCode);
+    }
+
+    private string FormatGithubFailureMessage(string failurePrefix, HttpStatusCode statusCode, string? errorMessage)
+    {
+        var message = string.IsNullOrWhiteSpace(errorMessage)
+            ? statusCode.ToString()
+            : errorMessage.Trim();
+
+        if (!_hasAuthentication
+            && statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+            && (message.Contains("Requires authentication", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("Must be authenticated", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("Bad credentials", StringComparison.OrdinalIgnoreCase)))
+        {
+            return $"{failurePrefix}: GitHub requires authentication for this request. Unauthenticated GitHub code search is very limited and may not be available for this query. Provide auth with --token <github_pat_...> or GITHUB_ACCESS_TOKEN. For GitHub App auth, use --github-app-id <id> --github-app-private-key-path <app.private-key.pem> and, when needed, --github-app-installation-id <id>.";
+        }
+
+        if (statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+            && message.Contains("Bad credentials", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"{failurePrefix}: GitHub rejected the configured credentials. Check that your token has not expired or been revoked. For a PAT, use --token or GITHUB_ACCESS_TOKEN. For GitHub App auth, check the app ID, installation ID, private key, and installation permissions.";
+        }
+
+        if (statusCode is HttpStatusCode.Forbidden
+            && message.Contains("Resource not accessible by integration", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"{failurePrefix}: GitHub App credentials are valid, but the installed app cannot access this resource. Install the app on the target repositories and grant read-only Contents and Metadata permissions.";
+        }
+
+        if (statusCode is HttpStatusCode.NotFound)
+        {
+            return $"{failurePrefix}: GitHub returned not found. The repository, file, or ref may not exist, or your credentials may not have access to it.";
+        }
+
+        return $"{failurePrefix}: {message}";
     }
 
     private static string FormatRateLimitResource(string resource)
