@@ -29,10 +29,12 @@ internal sealed class GithubClient : IDisposable
     private readonly Action? _clearStatusMessage;
     private readonly Dictionary<string, GithubRateLimitState> _rateLimitStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _fileContentCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, GithubGistResponse> _gistCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _gistFileContentCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, GithubRepositoryTreeResponse> _repositoryTreeCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _rateLimitLock = new();
     private readonly object _fileContentCacheLock = new();
+    private readonly object _gistCacheLock = new();
     private readonly object _gistFileContentCacheLock = new();
     private readonly object _repositoryTreeCacheLock = new();
 
@@ -534,14 +536,34 @@ internal sealed class GithubClient : IDisposable
 
     private async Task<GithubGistResponse> GetGistAsync(string gistId, CancellationToken cancellationToken)
     {
+        lock (_gistCacheLock)
+        {
+            if (_gistCache.TryGetValue(gistId, out var cachedGist))
+            {
+                return cachedGist;
+            }
+        }
+
         var requestUri = $"gists/{Uri.EscapeDataString(gistId)}";
-        return await GetJsonAsync(
+        var gist = await GetJsonAsync(
             requestUri,
             "core",
             "GitHub gist fetch failed",
             GithubJsonSerializerContext.Default.GithubGistResponse,
             cancellationToken,
             allowAnonymousRetry: true);
+
+        lock (_gistCacheLock)
+        {
+            _gistCache.TryAdd(gistId, gist);
+
+            if (!string.IsNullOrWhiteSpace(gist.Id))
+            {
+                _gistCache.TryAdd(gist.Id, gist);
+            }
+        }
+
+        return gist;
     }
 
     private async Task<IReadOnlyList<GithubSearchResult>> SearchGistAsync(GithubGistResponse gist, IReadOnlyList<string> searchTerms, CancellationToken cancellationToken)
@@ -852,14 +874,15 @@ internal sealed class GithubClient : IDisposable
         bool allowAnonymousRetry,
         bool useAuthentication = true)
     {
-        await WaitForKnownRateLimitAsync(rateLimitResource, cancellationToken);
-
         if (useAuthentication)
         {
             await EnsureFreshAccessTokenAsync(forceRefresh: false, cancellationToken);
         }
 
         var authorization = _httpClient.DefaultRequestHeaders.Authorization;
+        var useAuthenticatedRateLimit = useAuthentication && authorization is not null;
+
+        await WaitForKnownRateLimitAsync(rateLimitResource, useAuthenticatedRateLimit, cancellationToken);
 
         if (!useAuthentication)
         {
@@ -880,7 +903,7 @@ internal sealed class GithubClient : IDisposable
             }
         }
 
-        UpdateRateLimitState(response, rateLimitResource);
+        UpdateRateLimitState(response, rateLimitResource, useAuthenticatedRateLimit);
 
         if (!allowAnonymousRetry || response.IsSuccessStatusCode || authorization is null || !useAuthentication)
         {
@@ -897,8 +920,9 @@ internal sealed class GithubClient : IDisposable
         try
         {
             _httpClient.DefaultRequestHeaders.Authorization = null;
+            await WaitForKnownRateLimitAsync(rateLimitResource, useAuthentication: false, cancellationToken);
             var anonymousResponse = await _httpClient.GetAsync(requestUri, cancellationToken);
-            UpdateRateLimitState(anonymousResponse, rateLimitResource);
+            UpdateRateLimitState(anonymousResponse, rateLimitResource, useAuthentication: false);
             return anonymousResponse;
         }
         finally
@@ -934,9 +958,11 @@ internal sealed class GithubClient : IDisposable
         return _httpClient.DefaultRequestHeaders.Authorization is not null;
     }
 
-    private async Task WaitForKnownRateLimitAsync(string rateLimitResource, CancellationToken cancellationToken)
+    private async Task WaitForKnownRateLimitAsync(string rateLimitResource, bool useAuthentication, CancellationToken cancellationToken)
     {
-        while (TryGetKnownRateLimitDelay(rateLimitResource, out var retryDelay))
+        var rateLimitStateKey = CreateRateLimitStateKey(rateLimitResource, useAuthentication);
+
+        while (TryGetKnownRateLimitDelay(rateLimitStateKey, out var retryDelay))
         {
             if (retryDelay > MaxAutomaticRateLimitDelay)
             {
@@ -974,7 +1000,7 @@ internal sealed class GithubClient : IDisposable
         return false;
     }
 
-    private void UpdateRateLimitState(HttpResponseMessage response, string fallbackResource)
+    private void UpdateRateLimitState(HttpResponseMessage response, string fallbackResource, bool useAuthentication)
     {
         var resource = TryGetHeaderValue(response.Headers, "X-RateLimit-Resource", out var resourceValue)
             ? resourceValue!
@@ -995,10 +1021,17 @@ internal sealed class GithubClient : IDisposable
             return;
         }
 
+        var rateLimitStateKey = CreateRateLimitStateKey(resource, useAuthentication);
+
         lock (_rateLimitLock)
         {
-            _rateLimitStates[resource] = new GithubRateLimitState(remaining, resetAt);
+            _rateLimitStates[rateLimitStateKey] = new GithubRateLimitState(remaining, resetAt);
         }
+    }
+
+    private static string CreateRateLimitStateKey(string resource, bool useAuthentication)
+    {
+        return $"{(useAuthentication ? "auth" : "anonymous")}:{resource}";
     }
 
     private bool TryGetRateLimitDelay(
@@ -1115,9 +1148,9 @@ internal sealed class GithubClient : IDisposable
             builder.Append($". Retry after {FormatDelay(retryDelay)}");
         }
 
-        if (!_hasAuthentication)
+        if (ShouldSuggestPatForRateLimit(rateLimitMessage))
         {
-            builder.Append(". Set GITHUB_ACCESS_TOKEN or pass --token to increase rate limits");
+            builder.Append(". For gist scans, use a GitHub PAT with --token or GITHUB_ACCESS_TOKEN to increase this limit; GitHub App installation tokens do not raise limits for arbitrary public gist reads");
         }
 
         if (!string.IsNullOrWhiteSpace(rateLimitMessage))
@@ -1126,6 +1159,17 @@ internal sealed class GithubClient : IDisposable
         }
 
         return new HttpRequestException(builder.ToString(), null, statusCode);
+    }
+
+    private bool ShouldSuggestPatForRateLimit(string? rateLimitMessage)
+    {
+        if (!_hasAuthentication)
+        {
+            return true;
+        }
+
+        return !string.IsNullOrWhiteSpace(rateLimitMessage)
+            && rateLimitMessage.Contains("Authenticated requests get a higher rate limit", StringComparison.OrdinalIgnoreCase);
     }
 
     private string FormatGithubFailureMessage(string failurePrefix, HttpStatusCode statusCode, string? errorMessage)

@@ -138,7 +138,10 @@ public sealed class SourcesTests
     public async Task SearchGistPagesAsync_UsesLazyAppTokenForGistApiFetches()
     {
         var accessTokenProvider = new CountingAccessTokenProvider();
-        var handler = new StubGithubHandler();
+        var handler = new StubGithubHandler
+        {
+            ExhaustAnonymousGistSearchRateLimit = true
+        };
         using var httpClient = new HttpClient(handler)
         {
             BaseAddress = new Uri("https://api.github.com/")
@@ -197,6 +200,31 @@ public sealed class SourcesTests
         Assert.NotEmpty(result.TextMatches!);
     }
 
+    [Fact]
+    public async Task GetGistFilesAsync_ReusesGistFetchedDuringSearch()
+    {
+        var handler = new StubGithubHandler();
+        using var httpClient = new HttpClient(handler)
+        {
+            BaseAddress = new Uri("https://api.github.com/")
+        };
+        using var client = new GithubClient(httpClient: httpClient);
+
+        GithubSearchResult? result = null;
+
+        await foreach (var page in client.SearchGistPagesAsync("Password1"))
+        {
+            result = Assert.Single(page.Items);
+        }
+
+        Assert.NotNull(result?.Gist);
+        var files = await client.GetGistFilesAsync(result.Gist.Id);
+
+        Assert.Single(files);
+        Assert.Equal(1, handler.Requests.Count(request =>
+            request.PathAndQuery.StartsWith("/gists/abc123abc123abc123abc123abc12312", StringComparison.Ordinal)));
+    }
+
     private sealed class CountingAccessTokenProvider : IGithubAccessTokenProvider
     {
         public int CallCount { get; private set; }
@@ -211,6 +239,7 @@ public sealed class SourcesTests
     private sealed class StubGithubHandler : HttpMessageHandler
     {
         public List<GithubRequestSnapshot> Requests { get; } = [];
+        public bool ExhaustAnonymousGistSearchRateLimit { get; init; }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -249,8 +278,8 @@ public sealed class SourcesTests
                 : pathAndQuery.StartsWith("/gists/abc123", StringComparison.Ordinal)
                 ? """
                   {
-                    "id": "abc123",
-                    "html_url": "https://gist.github.com/octo/abc123",
+                    "id": "abc123abc123abc123abc123abc12312",
+                    "html_url": "https://gist.github.com/octo/abc123abc123abc123abc123abc12312",
                     "description": "test gist",
                     "owner": { "login": "octo" },
                     "files": {
@@ -268,7 +297,7 @@ public sealed class SourcesTests
             if (string.Equals(host, "gist.github.com", StringComparison.OrdinalIgnoreCase)
                 && pathAndQuery.StartsWith("/search", StringComparison.Ordinal))
             {
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                var response = new HttpResponseMessage(HttpStatusCode.OK)
                 {
                     Content = new StringContent(
                         """
@@ -285,15 +314,23 @@ public sealed class SourcesTests
                         """,
                         Encoding.UTF8,
                         "text/html")
-                });
+                };
+                if (ExhaustAnonymousGistSearchRateLimit)
+                {
+                    response.Headers.TryAddWithoutValidation("X-RateLimit-Resource", "core");
+                    response.Headers.TryAddWithoutValidation("X-RateLimit-Remaining", "0");
+                    response.Headers.TryAddWithoutValidation("X-RateLimit-Reset", DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture));
+                }
+
+                return Task.FromResult(response);
             }
 
             if (pathAndQuery.StartsWith("/gists/abc123abc123abc123abc123abc12312", StringComparison.Ordinal))
             {
                 json = """
                        {
-                         "id": "abc123",
-                         "html_url": "https://gist.github.com/octo/abc123",
+                         "id": "abc123abc123abc123abc123abc12312",
+                         "html_url": "https://gist.github.com/octo/abc123abc123abc123abc123abc12312",
                          "description": "test gist",
                          "owner": { "login": "octo" },
                          "files": {
