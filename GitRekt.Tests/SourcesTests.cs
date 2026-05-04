@@ -88,6 +88,22 @@ public sealed class SourcesTests
     }
 
     [Fact]
+    public void ExtractGistSearchTerms_SplitsSimplePunctuationLikeGitHubSearch()
+    {
+        var terms = GithubClient.ExtractGistSearchTerms("Password:", useAdvancedQuery: false);
+
+        Assert.Equal(["Password"], terms);
+    }
+
+    [Fact]
+    public void ExtractGistSearchTerms_KeepsDomainLikeSimpleTerms()
+    {
+        var terms = GithubClient.ExtractGistSearchTerms("ghd.com", useAdvancedQuery: false);
+
+        Assert.Equal(["ghd.com"], terms);
+    }
+
+    [Fact]
     public async Task SearchGistPagesAsync_UsesGistSearchAndResolvesLineNumbers()
     {
         using var httpClient = new HttpClient(new StubGithubHandler())

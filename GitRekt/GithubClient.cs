@@ -16,6 +16,7 @@ internal sealed class GithubClient : IDisposable
     private const int MaxGistSearchResults = 1000;
     private const int MaxGistSnippetLength = 500;
     private const long MaxGistRawFileSizeBytes = 10 * 1024 * 1024;
+    private static readonly char[] GistSearchBoundaryPunctuation = ['"', '\'', '`', ',', ';', ':', '/', '\\', '*', '!', '?', '#', '$', '&', '+', '^', '|', '~', '<', '>', '(', ')', '{', '}', '[', ']'];
     private static readonly TimeSpan MaxAutomaticRateLimitDelay = TimeSpan.FromMinutes(1);
     private const int MaxAutomaticRateLimitRetries = 3;
     private static readonly TimeSpan SecondaryRateLimitDelay = TimeSpan.FromSeconds(15);
@@ -413,10 +414,7 @@ internal sealed class GithubClient : IDisposable
 
         if (!useAdvancedQuery)
         {
-            return query
-                .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            return ExtractSimpleGistSearchTerms(query);
         }
 
         var terms = new List<string>();
@@ -457,6 +455,47 @@ internal sealed class GithubClient : IDisposable
             .Where(term => !string.IsNullOrWhiteSpace(term))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static IReadOnlyList<string> ExtractSimpleGistSearchTerms(string query)
+    {
+        var terms = new List<string>();
+        var tokens = query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        foreach (var token in tokens)
+        {
+            var trimmedToken = token.Trim();
+
+            if (string.IsNullOrWhiteSpace(trimmedToken))
+            {
+                continue;
+            }
+
+            if (LooksLikeDomainOrHost(trimmedToken))
+            {
+                terms.Add(trimmedToken.Trim(GistSearchBoundaryPunctuation));
+                continue;
+            }
+
+            terms.AddRange(Regex.Split(trimmedToken, @"[\s\\.,:;/`'""=\*!?\#\$&\+\^\|~<>\(\)\{\}\[\]]+")
+                .Select(term => term.Trim())
+                .Where(term => !string.IsNullOrWhiteSpace(term)));
+        }
+
+        return terms
+            .Where(term => !string.IsNullOrWhiteSpace(term))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool LooksLikeDomainOrHost(string token)
+    {
+        var trimmedToken = token.Trim(GistSearchBoundaryPunctuation);
+
+        return Regex.IsMatch(
+            trimmedToken,
+            @"\A(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\z",
+            RegexOptions.CultureInvariant);
     }
 
     internal static int CountLinesBeforeIndex(string content, int index)
