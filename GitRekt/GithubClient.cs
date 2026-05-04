@@ -274,7 +274,7 @@ internal sealed class GithubClient : IDisposable
 
         for (var page = 1; processedGists < availableCount; page++)
         {
-            _showStatusMessage?.Invoke($"Searching GitHub gists page {page}...");
+            ShowGistSearchPageStatus(page, totalCount, availableCount);
             var gistSearchPage = await GetGistSearchPageAsync(query, page, cancellationToken);
 
             if (page == 1)
@@ -320,6 +320,23 @@ internal sealed class GithubClient : IDisposable
                 break;
             }
         }
+    }
+
+    private void ShowGistSearchPageStatus(int page, int totalCount, int availableCount)
+    {
+        if (totalCount <= 0)
+        {
+            _showStatusMessage?.Invoke($"Searching GitHub gist candidate page {page}...");
+            return;
+        }
+
+        var cappedCount = Math.Min(totalCount, availableCount);
+        var totalPages = (int)Math.Ceiling(cappedCount / (double)GistSearchPageSize);
+        var cappedSuffix = totalCount > cappedCount
+            ? $" ({FormatRateLimitCount(cappedCount)} of {FormatRateLimitCount(totalCount)} candidates capped)"
+            : $" ({FormatRateLimitCount(totalCount)} candidates)";
+
+        _showStatusMessage?.Invoke($"Searching GitHub gist candidate page {page}/{totalPages}{cappedSuffix}...");
     }
 
     public async Task<string> GetGistFileContentAsync(string gistId, string filename, CancellationToken cancellationToken = default)
@@ -471,6 +488,12 @@ internal sealed class GithubClient : IDisposable
                 continue;
             }
 
+            if (LooksLikeEmailDomainSuffix(trimmedToken))
+            {
+                terms.Add(trimmedToken.Trim(GistSearchBoundaryPunctuation));
+                continue;
+            }
+
             if (LooksLikeDomainOrHost(trimmedToken))
             {
                 terms.Add(trimmedToken.Trim(GistSearchBoundaryPunctuation));
@@ -496,6 +519,15 @@ internal sealed class GithubClient : IDisposable
             trimmedToken,
             @"\A(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\z",
             RegexOptions.CultureInvariant);
+    }
+
+    private static bool LooksLikeEmailDomainSuffix(string token)
+    {
+        var trimmedToken = token.Trim(GistSearchBoundaryPunctuation);
+
+        return trimmedToken.Length > 1
+            && trimmedToken[0] == '@'
+            && LooksLikeDomainOrHost(trimmedToken[1..]);
     }
 
     internal static int CountLinesBeforeIndex(string content, int index)

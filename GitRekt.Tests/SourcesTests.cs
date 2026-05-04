@@ -104,6 +104,14 @@ public sealed class SourcesTests
     }
 
     [Fact]
+    public void ExtractGistSearchTerms_KeepsEmailDomainSuffixSimpleTerms()
+    {
+        var terms = GithubClient.ExtractGistSearchTerms("@ghd.com", useAdvancedQuery: false);
+
+        Assert.Equal(["@ghd.com"], terms);
+    }
+
+    [Fact]
     public async Task SearchGistPagesAsync_UsesGistSearchAndResolvesLineNumbers()
     {
         using var httpClient = new HttpClient(new StubGithubHandler())
