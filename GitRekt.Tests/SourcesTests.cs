@@ -114,7 +114,8 @@ public sealed class SourcesTests
     [Fact]
     public async Task SearchGistPagesAsync_UsesGistSearchAndResolvesLineNumbers()
     {
-        using var httpClient = new HttpClient(new StubGithubHandler())
+        var handler = new StubGithubHandler();
+        using var httpClient = new HttpClient(handler)
         {
             BaseAddress = new Uri("https://api.github.com/")
         };
@@ -132,6 +133,10 @@ public sealed class SourcesTests
         Assert.Equal("secret.txt", result.Path);
         Assert.NotNull(result.Gist);
         Assert.Contains("Password1", result.TextMatches![0].Fragment);
+        Assert.Contains(handler.Requests, request =>
+            string.Equals(request.Host, "gist.github.com", StringComparison.OrdinalIgnoreCase)
+            && request.PathAndQuery.Contains("s=updated", StringComparison.Ordinal)
+            && request.PathAndQuery.Contains("o=desc", StringComparison.Ordinal));
 
         var lineNumber = await client.TryFindGistFileLineNumberAsync(result.Gist.Id, result.Path, ["Password1"]);
         Assert.Equal(2, lineNumber);
@@ -140,7 +145,8 @@ public sealed class SourcesTests
     [Fact]
     public async Task SearchCodePagesAsync_DeserializesRepositoryResultsWithRepositorySource()
     {
-        using var httpClient = new HttpClient(new StubGithubHandler())
+        var handler = new StubGithubHandler();
+        using var httpClient = new HttpClient(handler)
         {
             BaseAddress = new Uri("https://api.github.com/")
         };
@@ -156,6 +162,10 @@ public sealed class SourcesTests
         var result = Assert.Single(Assert.Single(pages).Items);
         Assert.Equal(GithubSearchSource.Repositories, result.Source);
         Assert.Equal("octo/repo", result.Repository?.FullName);
+        Assert.Contains(handler.Requests, request =>
+            request.PathAndQuery.StartsWith("/search/code", StringComparison.Ordinal)
+            && request.PathAndQuery.Contains("sort=indexed", StringComparison.Ordinal)
+            && request.PathAndQuery.Contains("order=desc", StringComparison.Ordinal));
     }
 
     [Fact]

@@ -581,7 +581,7 @@ internal sealed class GithubClient : IDisposable
 
     private async Task<GithubCodeSearchResponse> SearchCodePageAsync(string searchQuery, int perPage, int page, CancellationToken cancellationToken)
     {
-        var requestUri = $"search/code?q={Uri.EscapeDataString(searchQuery)}&per_page={perPage}&page={page}";
+        var requestUri = $"search/code?q={Uri.EscapeDataString(searchQuery)}&per_page={perPage}&page={page}&sort=indexed&order=desc";
 
         return await GetJsonAsync(
             requestUri,
@@ -593,7 +593,7 @@ internal sealed class GithubClient : IDisposable
 
     private async Task<GithubGistSearchPage> GetGistSearchPageAsync(string query, int page, CancellationToken cancellationToken)
     {
-        var requestUri = $"https://gist.github.com/search?q={Uri.EscapeDataString(query)}&p={page}";
+        var requestUri = $"https://gist.github.com/search?q={Uri.EscapeDataString(query)}&p={page}&s=updated&o=desc";
         var html = await GetStringAsync(
             requestUri,
             "core",
