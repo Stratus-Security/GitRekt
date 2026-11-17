@@ -146,6 +146,8 @@ If the app has exactly one installation, `GITHUB_APP_INSTALLATION_ID` is optiona
 
 GitHub App installation tokens are short-lived; GitRekt creates and refreshes them from the app ID, installation ID, and private key. The app does not bypass GitHub code-search rate limits, but it gives cleaner per-installation scoping and avoids long-lived user credentials.
 
+Gist discovery itself uses GitHub's anonymous web search even when a GitHub App is configured. If GitHub exhausts a long-lived rate limit for one search source, GitRekt prints a warning, skips that source for the rest of the run, and continues with the remaining sources and queries. Use a PAT when you need a larger allowance for public gist scans.
+
 Equivalent CLI flags:
 
 ```bash
@@ -171,13 +173,16 @@ GitRekt --query "Password1" --ai --ai-model llama3.2 --ai-verdict possible
 ```
 This example command shows sensitive and potentially sensitive results but hides any that aren't considered sensitive by the AI.
 
-Use strict mode when broad PII-style searches produce too many ordinary business contact matches:
+AI verdicts are evidence-based: file names, environment-variable names, configuration keys, placeholders, and references to files that were not fetched are not findings by themselves. A `possible` verdict still requires a concrete visible artifact whose authenticity or impact is uncertain. In agent mode, GitRekt fetches a bounded set of high-signal files before classification and omits unfetched path candidates from the evidence given to the model.
+
+Use `--context` (also available as `--ai-context` or `--sensitivity-context`) as a natural-language sensitivity policy. GitRekt infers ordinary intent, while treating limiting words such as `only`, `except`, `exclude`, and `ignore` as binding. Context can broaden, narrow, or replace the default scope, and its meaningful terms also help agent mode prioritize repository paths and excerpts to inspect:
 
 ```bash
-GitRekt --query "@example.com" --ai --strict --ai-model llama3.2 --ai-verdict possible
+GitRekt --query "@examplebank.com" --ai-agent --ai-model llama3.2 --ai-verdict possible \
+  --context "Only report non-public information sensitive to Example Bank, including customer PII, payment exports, fraud rules, and proprietary risk code. Ignore ordinary public business information."
 ```
 
-Strict mode treats marketing lists, public staff directories, and ordinary work contact details such as name, company, email, job title, and office phone as low signal. It still keeps higher-impact findings such as credentials, tokens, private keys, home addresses, government IDs, dates of birth, salary or compensation data, financial data, medical data, personal account data, and private customer records.
+For a focused credential scan, context can be as short as `Look for OpenAI API keys`. For an exclusive corporate-data scan, use wording such as `Only consider non-public corporate data belonging to XYZ; ignore third-party and public information`. Context changes what directly observed material counts as sensitive; it does not allow the model to infer that unseen material exists, and it does not replace the initial `--query` used to find GitHub candidates.
 
 ### Agent Mode
 

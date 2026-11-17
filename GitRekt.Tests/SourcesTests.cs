@@ -80,6 +80,38 @@ public sealed class SourcesTests
     }
 
     [Fact]
+    public async Task ParseAsync_RejectsWhitespaceOnlyQueries()
+    {
+        var (exitCode, arguments) = await GitRektCli.ParseAsync(["--query", " "]);
+
+        Assert.Equal(1, exitCode);
+        Assert.Null(arguments);
+    }
+
+    [Fact]
+    public async Task ParseAsync_AcceptsSensitivityContextAndEnablesAiValidation()
+    {
+        const string sensitivityContext = "Customer PII, payment exports, and proprietary risk code are sensitive.";
+
+        var (exitCode, arguments) = await GitRektCli.ParseAsync(
+            ["--query", "example.com", "--ai-model", "test-model", "--context", sensitivityContext]);
+
+        Assert.Equal(0, exitCode);
+        Assert.NotNull(arguments?.AiValidation);
+        Assert.Equal(sensitivityContext, arguments.AiValidation.SensitivityContext);
+    }
+
+    [Fact]
+    public async Task ParseAsync_RejectsRemovedStrictOption()
+    {
+        var (exitCode, arguments) = await GitRektCli.ParseAsync(
+            ["--query", "example.com", "--ai-model", "test-model", "--strict"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.Null(arguments);
+    }
+
+    [Fact]
     public void ExtractGistSearchTerms_DropsAdvancedQualifiers()
     {
         var terms = GithubClient.ExtractGistSearchTerms("\"Password1\" language:C# path:/src/ token", useAdvancedQuery: true);
@@ -197,6 +229,35 @@ public sealed class SourcesTests
     }
 
     [Fact]
+    public async Task SearchGistPagesAsync_ThrowsTypedExceptionForKnownRateLimit()
+    {
+        var handler = new StubGithubHandler
+        {
+            ExhaustAnonymousGistSearchRateLimit = true
+        };
+        using var httpClient = new HttpClient(handler)
+        {
+            BaseAddress = new Uri("https://api.github.com/")
+        };
+        using var client = new GithubClient(httpClient: httpClient, accessTokenProvider: new CountingAccessTokenProvider());
+
+        await foreach (var _ in client.SearchGistPagesAsync("Password1"))
+        {
+        }
+
+        var exception = await Assert.ThrowsAsync<GithubRateLimitException>(async () =>
+        {
+            await foreach (var _ in client.SearchGistPagesAsync("Password2"))
+            {
+            }
+        });
+
+        Assert.Equal("core", exception.Resource);
+        Assert.Equal(0, exception.Remaining);
+        Assert.True(exception.RetryDelay > TimeSpan.FromMinutes(50));
+    }
+
+    [Fact]
     public async Task SearchCodePagesAsync_CreatesLazyAppToken()
     {
         var accessTokenProvider = new CountingAccessTokenProvider();
@@ -259,6 +320,52 @@ public sealed class SourcesTests
             request.PathAndQuery.StartsWith("/gists/abc123abc123abc123abc123abc12312", StringComparison.Ordinal)));
     }
 
+    [Fact]
+    public async Task SearchGistPagesAsync_DoesNotSendCredentialsToRawGistHost()
+    {
+        var handler = new StubGithubHandler
+        {
+            ReturnTruncatedGistFile = true
+        };
+        using var httpClient = new HttpClient(handler)
+        {
+            BaseAddress = new Uri("https://api.github.com/")
+        };
+        using var client = new GithubClient("test-token", httpClient);
+
+        await foreach (var _ in client.SearchGistPagesAsync("Password1"))
+        {
+        }
+
+        Assert.Contains(handler.Requests, request =>
+            string.Equals(request.Host, "gist.githubusercontent.com", StringComparison.OrdinalIgnoreCase)
+            && request.Authorization is null);
+        Assert.DoesNotContain(handler.Requests, request =>
+            string.Equals(request.Host, "gist.githubusercontent.com", StringComparison.OrdinalIgnoreCase)
+            && request.Authorization is not null);
+    }
+
+    [Fact]
+    public async Task GetRepositoryFileContentAsync_UsesRawMediaTypeForLargeFiles()
+    {
+        var handler = new StubGithubHandler
+        {
+            ReturnLargeRepositoryFile = true
+        };
+        using var httpClient = new HttpClient(handler)
+        {
+            BaseAddress = new Uri("https://api.github.com/")
+        };
+        using var client = new GithubClient("test-token", httpClient);
+
+        var content = await client.GetRepositoryFileContentAsync("octo/repo", "large.env");
+
+        Assert.Equal("Password1=large-secret", content);
+        Assert.Contains(handler.Requests, request =>
+            request.PathAndQuery.StartsWith("/repos/octo/repo/contents/large.env", StringComparison.Ordinal)
+            && request.Accept.Contains("application/vnd.github.raw+json", StringComparison.OrdinalIgnoreCase));
+    }
+
     private sealed class CountingAccessTokenProvider : IGithubAccessTokenProvider
     {
         public int CallCount { get; private set; }
@@ -274,12 +381,47 @@ public sealed class SourcesTests
     {
         public List<GithubRequestSnapshot> Requests { get; } = [];
         public bool ExhaustAnonymousGistSearchRateLimit { get; init; }
+        public bool ReturnTruncatedGistFile { get; init; }
+        public bool ReturnLargeRepositoryFile { get; init; }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var host = request.RequestUri?.Host ?? string.Empty;
             var pathAndQuery = request.RequestUri?.PathAndQuery ?? string.Empty;
-            Requests.Add(new GithubRequestSnapshot(host, pathAndQuery, request.Headers.Authorization?.ToString()));
+            var accept = string.Join(',', request.Headers.Accept.Select(value => value.MediaType));
+            Requests.Add(new GithubRequestSnapshot(host, pathAndQuery, request.Headers.Authorization?.ToString(), accept));
+
+            if (string.Equals(host, "gist.githubusercontent.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("first line\nPassword1 is here\nlast line", Encoding.UTF8, "text/plain")
+                });
+            }
+
+            if (ReturnLargeRepositoryFile
+                && pathAndQuery.StartsWith("/repos/octo/repo/contents/large.env", StringComparison.Ordinal))
+            {
+                var isRawRequest = request.Headers.Accept.Any(value =>
+                    string.Equals(value.MediaType, "application/vnd.github.raw+json", StringComparison.OrdinalIgnoreCase));
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = isRawRequest
+                        ? new StringContent("Password1=large-secret", Encoding.UTF8, "text/plain")
+                        : new StringContent(
+                            """
+                            {
+                              "type": "file",
+                              "encoding": "none",
+                              "content": "",
+                              "size": 2097152
+                            }
+                            """,
+                            Encoding.UTF8,
+                            "application/json")
+                });
+            }
             var json = pathAndQuery.StartsWith("/search/code", StringComparison.Ordinal)
                 ? """
                   {
@@ -361,7 +503,25 @@ public sealed class SourcesTests
 
             if (pathAndQuery.StartsWith("/gists/abc123abc123abc123abc123abc12312", StringComparison.Ordinal))
             {
-                json = """
+                json = ReturnTruncatedGistFile
+                    ? """
+                      {
+                        "id": "abc123abc123abc123abc123abc12312",
+                        "html_url": "https://gist.github.com/octo/abc123abc123abc123abc123abc12312",
+                        "description": "test gist",
+                        "owner": { "login": "octo" },
+                        "files": {
+                          "secret.txt": {
+                            "filename": "secret.txt",
+                            "size": 35,
+                            "truncated": true,
+                            "raw_url": "https://gist.githubusercontent.com/octo/abc123/raw/secret.txt",
+                            "content": "first line"
+                          }
+                        }
+                      }
+                      """
+                    : """
                        {
                          "id": "abc123abc123abc123abc123abc12312",
                          "html_url": "https://gist.github.com/octo/abc123abc123abc123abc123abc12312",
@@ -386,5 +546,5 @@ public sealed class SourcesTests
         }
     }
 
-    private sealed record GithubRequestSnapshot(string Host, string PathAndQuery, string? Authorization);
+    private sealed record GithubRequestSnapshot(string Host, string PathAndQuery, string? Authorization, string Accept);
 }

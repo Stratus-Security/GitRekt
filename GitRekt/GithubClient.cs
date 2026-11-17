@@ -16,6 +16,7 @@ internal sealed class GithubClient : IDisposable
     private const int MaxGistSearchResults = 1000;
     private const int MaxGistSnippetLength = 500;
     private const long MaxGistRawFileSizeBytes = 10 * 1024 * 1024;
+    private const long MaxRepositoryRawFileSizeBytes = 10 * 1024 * 1024;
     private static readonly char[] GistSearchBoundaryPunctuation = ['"', '\'', '`', ',', ';', ':', '/', '\\', '*', '!', '?', '#', '$', '&', '+', '^', '|', '~', '<', '>', '(', ')', '{', '}', '[', ']'];
     private static readonly TimeSpan MaxAutomaticRateLimitDelay = TimeSpan.FromMinutes(1);
     private const int MaxAutomaticRateLimitRetries = 3;
@@ -29,9 +30,9 @@ internal sealed class GithubClient : IDisposable
     private readonly Action<string>? _showStatusMessage;
     private readonly Action? _clearStatusMessage;
     private readonly Dictionary<string, GithubRateLimitState> _rateLimitStates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _fileContentCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, GithubRepositoryFileContent> _fileContentCache = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GithubGistResponse> _gistCache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _gistFileContentCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _gistFileContentCache = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GithubRepositoryTreeResponse> _repositoryTreeCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _rateLimitLock = new();
     private readonly object _fileContentCacheLock = new();
@@ -189,12 +190,19 @@ internal sealed class GithubClient : IDisposable
         return tree;
     }
 
-    public async Task<string> GetRepositoryFileContentAsync(string repositoryFullName, string path, CancellationToken cancellationToken = default)
+    public async Task<string> GetRepositoryFileContentAsync(string repositoryFullName, string path, CancellationToken cancellationToken = default, string? reference = null)
+    {
+        var file = await GetRepositoryFileAsync(repositoryFullName, path, cancellationToken, reference);
+        return file.Content;
+    }
+
+    public async Task<GithubRepositoryFileContent> GetRepositoryFileAsync(string repositoryFullName, string path, CancellationToken cancellationToken = default, string? reference = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(repositoryFullName);
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
 
-        var cacheKey = $"{repositoryFullName}\n{path}";
+        reference = string.IsNullOrWhiteSpace(reference) ? null : reference;
+        var cacheKey = $"{repositoryFullName.ToLowerInvariant()}\n{reference}\n{path}";
 
         lock (_fileContentCacheLock)
         {
@@ -205,6 +213,11 @@ internal sealed class GithubClient : IDisposable
         }
 
         var requestUri = $"repos/{Uri.EscapeDataString(repositoryFullName).Replace("%2F", "/", StringComparison.Ordinal)}/contents/{Uri.EscapeDataString(path).Replace("%2F", "/", StringComparison.Ordinal)}";
+        if (reference is not null)
+        {
+            requestUri += $"?ref={Uri.EscapeDataString(reference)}";
+        }
+
         var contentResponse = await GetJsonAsync(
             requestUri,
             "core",
@@ -217,29 +230,49 @@ internal sealed class GithubClient : IDisposable
             throw new InvalidOperationException($"GitHub path '{path}' is not a file.");
         }
 
-        if (!string.Equals(contentResponse.Encoding, "base64", StringComparison.OrdinalIgnoreCase)
-            || string.IsNullOrWhiteSpace(contentResponse.Content))
+        string content;
+
+        if (string.Equals(contentResponse.Encoding, "base64", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(contentResponse.Content))
         {
-            throw new InvalidOperationException($"GitHub file '{path}' did not include base64 content.");
+            var normalizedContent = contentResponse.Content.Replace("\n", string.Empty, StringComparison.Ordinal).Replace("\r", string.Empty, StringComparison.Ordinal);
+            var bytes = Convert.FromBase64String(normalizedContent);
+            content = Encoding.UTF8.GetString(bytes);
+        }
+        else if (string.Equals(contentResponse.Encoding, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            if (contentResponse.Size is > MaxRepositoryRawFileSizeBytes)
+            {
+                throw new InvalidOperationException($"GitHub file '{path}' exceeds the 10 MB raw-content limit.");
+            }
+
+            content = await GetStringAsync(
+                requestUri,
+                "core",
+                "GitHub raw file fetch failed",
+                cancellationToken,
+                acceptMediaType: "application/vnd.github.raw+json");
+        }
+        else
+        {
+            throw new InvalidOperationException($"GitHub file '{path}' did not include readable content.");
         }
 
-        var normalizedContent = contentResponse.Content.Replace("\n", string.Empty, StringComparison.Ordinal).Replace("\r", string.Empty, StringComparison.Ordinal);
-        var bytes = Convert.FromBase64String(normalizedContent);
-        var content = Encoding.UTF8.GetString(bytes);
+        var file = new GithubRepositoryFileContent(content, contentResponse.HtmlUrl);
 
         lock (_fileContentCacheLock)
         {
-            _fileContentCache.TryAdd(cacheKey, content);
+            _fileContentCache.TryAdd(cacheKey, file);
         }
 
-        return content;
+        return file;
     }
 
-    public async Task<int?> TryFindRepositoryFileLineNumberAsync(string repositoryFullName, string path, IEnumerable<string> searchTerms, CancellationToken cancellationToken = default)
+    public async Task<int?> TryFindRepositoryFileLineNumberAsync(string repositoryFullName, string path, IEnumerable<string> searchTerms, CancellationToken cancellationToken = default, string? reference = null)
     {
         try
         {
-            var content = await GetRepositoryFileContentAsync(repositoryFullName, path, cancellationToken);
+            var content = await GetRepositoryFileContentAsync(repositoryFullName, path, cancellationToken, reference);
 
             foreach (var searchTerm in searchTerms.Where(term => !string.IsNullOrWhiteSpace(term)).Distinct(StringComparer.OrdinalIgnoreCase))
             {
@@ -344,7 +377,7 @@ internal sealed class GithubClient : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(gistId);
         ArgumentException.ThrowIfNullOrWhiteSpace(filename);
 
-        var cacheKey = $"{gistId}\n{filename}";
+        var cacheKey = $"{gistId.ToLowerInvariant()}\n{filename}";
 
         lock (_gistFileContentCacheLock)
         {
@@ -670,7 +703,7 @@ internal sealed class GithubClient : IDisposable
             }
 
             var ownerLogin = gist.Owner?.Login;
-            var htmlUrl = CreateGistFileUrl(gist.HtmlUrl, ownerLogin, gist.Id, filename);
+            var htmlUrl = GithubFileLinks.CreateGistFileUrl(gist.HtmlUrl, ownerLogin, gist.Id, filename);
             results.Add(new GithubSearchResult(
                 filename,
                 filename,
@@ -686,7 +719,7 @@ internal sealed class GithubClient : IDisposable
 
     private async Task<string?> GetGistFileContentAsync(string gistId, string filename, GithubGistFile file, CancellationToken cancellationToken)
     {
-        var cacheKey = $"{gistId}\n{filename}";
+        var cacheKey = $"{gistId.ToLowerInvariant()}\n{filename}";
 
         lock (_gistFileContentCacheLock)
         {
@@ -722,7 +755,12 @@ internal sealed class GithubClient : IDisposable
     {
         try
         {
-            using var response = await SendGetAsync(requestUri, "core", cancellationToken, allowAnonymousRetry: true);
+            using var response = await SendGetAsync(
+                requestUri,
+                "core",
+                cancellationToken,
+                allowAnonymousRetry: false,
+                useAuthentication: false);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -806,17 +844,6 @@ internal sealed class GithubClient : IDisposable
             .ToList();
     }
 
-    private static string CreateGistFileUrl(string? gistHtmlUrl, string? ownerLogin, string gistId, string filename)
-    {
-        var baseUrl = !string.IsNullOrWhiteSpace(gistHtmlUrl)
-            ? gistHtmlUrl.TrimEnd('/')
-            : !string.IsNullOrWhiteSpace(ownerLogin)
-                ? $"https://gist.github.com/{Uri.EscapeDataString(ownerLogin)}/{Uri.EscapeDataString(gistId)}"
-                : $"https://gist.github.com/{Uri.EscapeDataString(gistId)}";
-        var anchor = Uri.EscapeDataString($"file-{filename.ToLowerInvariant().Replace(".", "-", StringComparison.Ordinal).Replace(" ", "-", StringComparison.Ordinal)}");
-        return $"{baseUrl}#{anchor}";
-    }
-
     private static GithubGistSearchPage ParseGistSearchPage(string html)
     {
         if (string.IsNullOrWhiteSpace(html))
@@ -869,9 +896,10 @@ internal sealed class GithubClient : IDisposable
         string failurePrefix,
         CancellationToken cancellationToken,
         bool allowAnonymousRetry = false,
-        bool useAuthentication = true)
+        bool useAuthentication = true,
+        string? acceptMediaType = null)
     {
-        using var response = await SendGetAsync(requestUri, rateLimitResource, cancellationToken, allowAnonymousRetry, useAuthentication);
+        using var response = await SendGetAsync(requestUri, rateLimitResource, cancellationToken, allowAnonymousRetry, useAuthentication, acceptMediaType);
 
         if (response.IsSuccessStatusCode)
         {
@@ -943,7 +971,8 @@ internal sealed class GithubClient : IDisposable
         string rateLimitResource,
         CancellationToken cancellationToken,
         bool allowAnonymousRetry,
-        bool useAuthentication = true)
+        bool useAuthentication = true,
+        string? acceptMediaType = null)
     {
         if (useAuthentication)
         {
@@ -964,7 +993,8 @@ internal sealed class GithubClient : IDisposable
 
         try
         {
-            response = await _httpClient.GetAsync(requestUri, cancellationToken);
+            using var request = CreateGetRequest(requestUri, acceptMediaType);
+            response = await _httpClient.SendAsync(request, cancellationToken);
         }
         finally
         {
@@ -992,7 +1022,8 @@ internal sealed class GithubClient : IDisposable
         {
             _httpClient.DefaultRequestHeaders.Authorization = null;
             await WaitForKnownRateLimitAsync(rateLimitResource, useAuthentication: false, cancellationToken);
-            var anonymousResponse = await _httpClient.GetAsync(requestUri, cancellationToken);
+            using var anonymousRequest = CreateGetRequest(requestUri, acceptMediaType);
+            var anonymousResponse = await _httpClient.SendAsync(anonymousRequest, cancellationToken);
             UpdateRateLimitState(anonymousResponse, rateLimitResource, useAuthentication: false);
             return anonymousResponse;
         }
@@ -1000,6 +1031,18 @@ internal sealed class GithubClient : IDisposable
         {
             _httpClient.DefaultRequestHeaders.Authorization = authorization;
         }
+    }
+
+    private static HttpRequestMessage CreateGetRequest(string requestUri, string? acceptMediaType)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+
+        if (!string.IsNullOrWhiteSpace(acceptMediaType))
+        {
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(acceptMediaType));
+        }
+
+        return request;
     }
 
     private async Task EnsureFreshAccessTokenAsync(bool forceRefresh, CancellationToken cancellationToken)
@@ -1204,7 +1247,7 @@ internal sealed class GithubClient : IDisposable
         return DefaultRateLimitDelay;
     }
 
-    private HttpRequestException CreateRateLimitException(HttpStatusCode statusCode, TimeSpan retryDelay, string? rateLimitMessage, GithubRateLimitDetails rateLimitDetails)
+    private GithubRateLimitException CreateRateLimitException(HttpStatusCode statusCode, TimeSpan retryDelay, string? rateLimitMessage, GithubRateLimitDetails rateLimitDetails)
     {
         var builder = new StringBuilder($"GitHub {FormatRateLimitResource(rateLimitDetails.Resource)} rate limit exceeded");
 
@@ -1229,7 +1272,13 @@ internal sealed class GithubClient : IDisposable
             builder.Append($". {rateLimitMessage}");
         }
 
-        return new HttpRequestException(builder.ToString(), null, statusCode);
+        return new GithubRateLimitException(
+            builder.ToString(),
+            statusCode,
+            rateLimitDetails.Resource,
+            retryDelay,
+            rateLimitDetails.Remaining,
+            rateLimitDetails.Limit);
     }
 
     private bool ShouldSuggestPatForRateLimit(string? rateLimitMessage)
@@ -1366,6 +1415,9 @@ internal sealed class GithubErrorResponse
 
 internal sealed class GithubContentResponse
 {
+    [JsonPropertyName("html_url")]
+    public string? HtmlUrl { get; init; }
+
     [JsonPropertyName("type")]
     public string? Type { get; init; }
 
@@ -1374,7 +1426,12 @@ internal sealed class GithubContentResponse
 
     [JsonPropertyName("content")]
     public string? Content { get; init; }
+
+    [JsonPropertyName("size")]
+    public long? Size { get; init; }
 }
+
+internal sealed record GithubRepositoryFileContent(string Content, string? HtmlUrl);
 
 internal sealed class GithubRepositoryTreeResponse
 {
@@ -1401,6 +1458,32 @@ internal sealed record GithubRepositoryTreeEntry(
 internal sealed record GithubRateLimitState(int? Remaining, DateTimeOffset? ResetAt);
 
 internal sealed record GithubRateLimitDetails(string Resource, int? Remaining, int? Limit);
+
+internal sealed class GithubRateLimitException : HttpRequestException
+{
+    public GithubRateLimitException(
+        string message,
+        HttpStatusCode statusCode,
+        string resource,
+        TimeSpan retryDelay,
+        int? remaining,
+        int? limit)
+        : base(message, null, statusCode)
+    {
+        Resource = resource;
+        RetryDelay = retryDelay;
+        Remaining = remaining;
+        Limit = limit;
+    }
+
+    public string Resource { get; }
+
+    public TimeSpan RetryDelay { get; }
+
+    public int? Remaining { get; }
+
+    public int? Limit { get; }
+}
 
 internal enum GithubSearchSource
 {

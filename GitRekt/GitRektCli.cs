@@ -36,7 +36,9 @@ internal static class GitRektCli
         "--ai-verdict",
         "--ai-category",
         "--ai-show",
-        "--strict",
+        "--context",
+        "--ai-context",
+        "--sensitivity-context",
         "--help",
         "-h",
         "/?",
@@ -66,7 +68,10 @@ internal static class GitRektCli
         "--openai-api-key",
         "--ai-verdict",
         "--ai-category",
-        "--ai-show"
+        "--ai-show",
+        "--context",
+        "--ai-context",
+        "--sensitivity-context"
     };
 
     public static async Task<(int ExitCode, GitRektCliArguments? Arguments)> ParseAsync(string[] args)
@@ -122,7 +127,9 @@ internal static class GitRektCli
         aiVerdictOption.AddAlias("--ai-category");
         aiVerdictOption.AddAlias("--ai-show");
 
-        var strictOption = new Option<bool>("--strict", "Use stricter AI validation. Ordinary business contact lists are treated as low signal unless stronger sensitive data is present.");
+        var sensitivityContextOption = new Option<string?>("--context", "Optional context describing what should count as sensitive for this scan.");
+        sensitivityContextOption.AddAlias("--ai-context");
+        sensitivityContextOption.AddAlias("--sensitivity-context");
 
         var rootCommand = new RootCommand("""
 Search GitHub gists and code.
@@ -137,7 +144,7 @@ Examples:
   GitRekt --advanced --query "\"Password1\" language:C# path:/src/" --query "\"Password2\" language:C#"
   GitRekt --query "Password1" --ai --ai-model llama3.2
   GitRekt --query "Password1" --ai --ai-model llama3.2 --ai-verdict possible
-  GitRekt --query "@example.com" --ai --strict --ai-model llama3.2 --ai-verdict possible
+  GitRekt --query "@example.com" --ai-agent --ai-model llama3.2 --ai-verdict possible --context "Customer PII, payment exports, and proprietary risk code are sensitive."
   GitRekt --query "Password1" --ai --ai-agent --ai-model llama3.2 --ai-verdict possible
   GitRekt --query "Password1" --ai-provider gemini --ai-model gemini-2.5-flash
   GitRekt --query "Password1" --ai-provider openai --ai-model gpt-5-mini
@@ -159,7 +166,7 @@ Examples:
         rootCommand.AddOption(aiModelOption);
         rootCommand.AddOption(aiApiKeyOption);
         rootCommand.AddOption(aiVerdictOption);
-        rootCommand.AddOption(strictOption);
+        rootCommand.AddOption(sensitivityContextOption);
         rootCommand.AddValidator(parseResult =>
         {
             if (IsHelpRequested(args))
@@ -167,7 +174,9 @@ Examples:
                 return;
             }
 
-            var queries = parseResult.GetValueForOption(queryOption) ?? [];
+            var queries = (parseResult.GetValueForOption(queryOption) ?? [])
+                .Where(query => !string.IsNullOrWhiteSpace(query))
+                .ToArray();
             var sources = parseResult.GetValueForOption(sourcesOption);
             var hasSources = parseResult.FindResultFor(sourcesOption) is not null;
 
@@ -189,9 +198,9 @@ Examples:
             var hasAiModel = parseResult.FindResultFor(aiModelOption) is not null;
             var hasAiApiKey = parseResult.FindResultFor(aiApiKeyOption) is not null;
             var hasAiVerdictFilter = !string.IsNullOrWhiteSpace(parseResult.GetValueForOption(aiVerdictOption));
-            var hasStrict = parseResult.GetValueForOption(strictOption);
+            var hasSensitivityContext = !string.IsNullOrWhiteSpace(parseResult.GetValueForOption(sensitivityContextOption));
 
-            if (!hasAiFlag && !hasAiAgentFlag && !hasAiProvider && !hasAiModel && !hasAiApiKey && !hasAiVerdictFilter && !hasStrict)
+            if (!hasAiFlag && !hasAiAgentFlag && !hasAiProvider && !hasAiModel && !hasAiApiKey && !hasAiVerdictFilter && !hasSensitivityContext)
             {
                 return;
             }
@@ -250,7 +259,9 @@ Examples:
         rootCommand.SetHandler((InvocationContext context) =>
         {
             var parseResult = context.ParseResult;
-            var queries = parseResult.GetValueForOption(queryOption) ?? [];
+            var queries = (parseResult.GetValueForOption(queryOption) ?? [])
+                .Where(query => !string.IsNullOrWhiteSpace(query))
+                .ToArray();
             var token = parseResult.GetValueForOption(tokenOption);
             var githubAppId = parseResult.GetValueForOption(githubAppIdOption) ?? Environment.GetEnvironmentVariable("GITHUB_APP_ID");
             var githubAppInstallationId = parseResult.GetValueForOption(githubAppInstallationIdOption) ?? Environment.GetEnvironmentVariable("GITHUB_APP_INSTALLATION_ID");
@@ -266,7 +277,7 @@ Examples:
             var aiModel = parseResult.GetValueForOption(aiModelOption);
             var aiApiKey = parseResult.GetValueForOption(aiApiKeyOption);
             var aiVerdicts = parseResult.GetValueForOption(aiVerdictOption);
-            var strictMode = parseResult.GetValueForOption(strictOption);
+            var sensitivityContext = parseResult.GetValueForOption(sensitivityContextOption);
             var aiVerdictFilter = ParseAiValidationVerdict(aiVerdicts);
             var shouldValidateAi = validateAi
                 || useAiAgent
@@ -274,7 +285,7 @@ Examples:
                 || !string.IsNullOrWhiteSpace(aiModel)
                 || !string.IsNullOrWhiteSpace(aiApiKey)
                 || aiVerdictFilter is not null
-                || strictMode;
+                || !string.IsNullOrWhiteSpace(sensitivityContext);
 
             if (queries.Length == 0)
             {
@@ -336,7 +347,7 @@ Examples:
             }
 
             parsedArguments = new GitRektCliArguments(
-                queries.Where(query => !string.IsNullOrWhiteSpace(query)).ToList(),
+                queries,
                 accessToken,
                 githubAppAuthentication,
                 outputPath,
@@ -347,8 +358,8 @@ Examples:
                         aiProvider,
                         aiModel!,
                         useAiAgent,
-                        strictMode,
-                        aiApiKey)
+                        aiApiKey,
+                        sensitivityContext)
                     : null,
                 aiVerdictFilter);
         });
@@ -660,7 +671,8 @@ Options:
   --ai-api-key, --gemini-api-key, --openai-api-key <key>
                                                AI provider API key. For Gemini, defaults to GEMINI_API_KEY or GOOGLE_API_KEY. For OpenAI, defaults to OPENAI_API_KEY.
   --ai-verdict <verdict>                      Only show AI verdicts at or above likely, possible, or none.
-  --strict                                    Use stricter AI validation. Ordinary business contact lists and low value PII are ignored.
+  --context, --ai-context, --sensitivity-context <text>
+                                               Describe what should count as sensitive for this scan.
   -h, --help                                  Show help.
 
 Examples:
@@ -669,6 +681,7 @@ Examples:
   GitRekt --query "Password1" --sources gists
   GitRekt --query "Password1" --ai-provider gemini --ai-model gemini-2.5-flash
   GitRekt --query "Password1" --ai-provider openai --ai-model gpt-5-mini
+  GitRekt --query "@example.com" --ai-agent --ai-model llama3.2 --ai-verdict possible --context "Customer PII, payment exports, and proprietary risk code are sensitive."
   GitRekt --github-app-id 12345 --query "Password1"
   GitRekt --github-app-id 12345 --github-app-installation-id 67890 --github-app-private-key-path app.private-key.pem --query "Password1"
 """);
